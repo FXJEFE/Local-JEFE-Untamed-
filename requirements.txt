@@ -1,0 +1,54 @@
+# =============================================================================
+# FXJEFE Local Larry / Larry G-Force v2.1 - Production Requirements
+# =============================================================================
+# This file is the single source of truth for the clean GITHUB distribution.
+# Install with: pip install -r requirements.txt
+# =============================================================================
+
+# --- Core Runtime ---
+python-dotenv>=1.0.0
+pydantic>=2.5.0
+fastapi>=0.109.0
+uvicorn[standard]>=0.27.0
+
+# --- Ollama Integration ---
+ollama>=0.1.0
+
+# --- HTTP / Async ---
+requests>=2.31.0
+aiohttp>=3.9.0
+httpx>=0.26.0
+
+# --- Vector Store & RAG (Production) ---
+chromadb>=1.0.0
+sentence-transformers>=2.2.0
+
+# --- Data & File Handling ---
+pandas>=2.1.0
+numpy>=1.26.0
+pyyaml>=6.0.0
+orjson>=3.9.0
+openpyxl>=3.1.2
+
+# --- Web & Content ---
+beautifulsoup4>=4.12.0
+lxml>=5.0.0
+html2text>=2024.2.26
+youtube-transcript-api>=0.6.0
+yt-dlp>=2024.1.0
+
+# --- Browser Automation (FXJEFE MCP + Web Tools) ---
+playwright>=1.40.0
+
+# --- PDF Tools (FXJEFE MCP) ---
+pdfplumber>=0.11.0
+pypdf>=5.0.0
+
+# --- Security & MCP Foundation ---
+mcp>=1.0.0
+
+# --- Optional but Recommended ---
+# psutil>=5.9.0               # For resource governor & hardware monitoring
+# networkx>=3.0               # For knowledge graphs (legacy locallarry_agent)
+# python-docx>=1.0.0          # Word document support
+# rich>=13.0.0                # Better terminal output (optional)

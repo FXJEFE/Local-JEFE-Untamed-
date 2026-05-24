@@ -1,0 +1,99 @@
+{
+    "agent_name": "LARRY G-FORCE",
+    "version": "2.0.0",
+    "_working_directory_comment": "Leave null for portable mode — larry_paths.BASE_DIR is used (the dir containing agent_v2.py). Set to an absolute path only to override.",
+    "working_directory": null,
+    "hardware": {
+        "mode": "GPU",
+        "ram_gb": 64,
+        "ram_type": "DDR5",
+        "gpu": "RTX 4060 8GB",
+        "gpu_used_for": "LLM inference + reranker (CUDA_VISIBLE_DEVICES=0)",
+        "cuda_visible_devices": "0",
+        "gpu_power_limit_w": 100,
+        "gpu_persistence_mode": true
+    },
+    "ollama": {
+        "host": "http://localhost:11434",
+        "default_model": "dolphin-mixtral:8x7b",
+        "embedding_model": "nomic-embed-text:latest",
+        "timeout": 1800,
+        "num_parallel": 1,
+        "keep_alive": "10m",
+        "num_gpu": 0,
+        "cli_default_model": "dolphin-mixtral:8x7b",
+        "telegram_default_model": "dolphinecoder:15b"
+    },
+    "profiles": {
+        "default": "ACCURACY",
+        "available": [
+            "SPEED",
+            "BALANCED",
+            "ACCURACY",
+            "ULTRA_CONTEXT"
+        ],
+        "hardware_mode": "CPU_DDR5_64GB",
+        "flagship_model": "llama3.3:70b",
+        "coding_model": "qwen3-coder:30b",
+        "fast_model": "ministral-3:latest",
+        "ultra_context_model": "qwen2.5-128k:latest",
+        "tier1_models": [
+            "llama3.3:70b",
+            "qwen2.5:32b-instruct",
+            "glm-4.7-flash:latest",
+            "qwen3-coder:30b"
+        ],
+        "tier2_models": [
+            "dolphin-mixtral:8x7b",
+            "devstral-small-2:24b",
+            "qwen2.5:14b-instruct-q4_K_M",
+            "ministral-3:14b",
+            "qwen2.5-128k:latest"
+        ],
+        "tier3_fast_models": [
+            "ministral-3:latest",
+            "mistral:latest",
+            "qwen2.5:7b-instruct-q5_K_M",
+            "qwen2.5:7b-instruct"
+        ],
+        "tier4_tiny_models": [
+            "llama3.2:latest",
+            "llama3.2-ctx:latest",
+            "lfm2.5-thinking:1.2b",
+            "granite4:1b"
+        ]
+    },
+    "features": {
+        "voice_enabled": false,
+        "mcp_enabled": true,
+        "rag_enabled": true,
+        "telegram_enabled": true,
+        "web_ui_enabled": false
+    },
+    "rag": {
+        "backend": "chroma",
+        "chroma_path": "./chroma_db",
+        "embedding_model": "nomic-embed-text:latest",
+        "chunk_size": 800,
+        "chunk_overlap": 250,
+        "reranker_model": "BAAI/bge-reranker-v2-m3",
+        "reranker_device": "cuda:0"
+    },
+    "database": {
+        "sqlite_path": "./data/unified_context.db",
+        "memory_path": "./memory.json"
+    },
+    "mcp": {
+        "config_path": "./mcp.json",
+        "timeout": 60
+    },
+    "logging": {
+        "level": "INFO",
+        "file": "./logs/larry.log"
+    },
+    "ui": {
+        "theme": "gold1",
+        "show_thinking": true,
+        "show_tool_calls": true
+    }
+}

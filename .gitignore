@@ -1,0 +1,109 @@
+# =============================================================================
+# FXJEFE Local Larry / Larry G-Force v2.1 - .gitignore
+# =============================================================================
+
+# --- Secrets & Credentials ---
+.env
+.env.*
+*.key
+*.pem
+*.crt
+user_config.json
+larry_config.local.json
+secrets/
+*.token
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+.conda/
+
+# --- IDE / Editor ---
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+*.code-workspace
+
+# --- Logs & Runtime Data ---
+logs/
+*.log
+*.log.*
+larry_logs/
+data/session_summaries.jsonl
+*.pid
+
+# --- Databases & Vector Stores ---
+*.db
+*.sqlite
+*.sqlite3
+chroma_db/
+memory.json
+openclaws_memory.json
+context7_cache/
+
+# --- Sandbox & Temporary Work ---
+sandbox/
+exports/
+imports/
+screenshots/
+voice_cache/
+tmp/
+temp/
+
+# --- Build / Locked Distribution ---
+dist/
+build/
+*.exe
+*.spec
+*.pyd
+PyArmor/
+obfuscated/
+
+# --- Node / Frontend (if any) ---
+node_modules/
+package-lock.json
+
+# --- OS Generated ---
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# --- Large Model Files (never commit models) ---
+*.gguf
+*.bin
+*.safetensors
+ollama_models/
+
+# --- Backup & Repair Scripts (development only) ---
+scripts/__*.py
+*.bak
+
+# --- Personal / Local Overrides ---
+*.local
+*.local.*
+FXJEFEprofile.jpg   # Keep this out unless you explicitly want to distribute the image

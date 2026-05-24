@@ -1,0 +1,25 @@
+<?xml version='1.0' encoding='utf-8'?>
+<graphml xmlns="http://graphml.graphdrawing.org/xmlns" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://graphml.graphdrawing.org/xmlns http://graphml.graphdrawing.org/xmlns/1.0/graphml.xsd"><key id="d4" for="node" attr.name="created" attr.type="string"/>
+<key id="d3" for="node" attr.name="type" attr.type="string"/>
+<key id="d2" for="node" attr.name="critique_score" attr.type="string"/>
+<key id="d1" for="node" attr.name="output_summary" attr.type="string"/>
+<key id="d0" for="node" attr.name="input" attr.type="string"/>
+<graph edgedefault="directed"><node id="Event:Interaction_session_1779599693:40c492ff">
+  <data key="d0">/tools</data>
+  <data key="d1">Error calling Ollama: model 'llama3.1:8b' not found (status code: 404)
+
+My quick self-critique: Error calling Ollama: model 'llama3.1:8b' not found (s</data>
+  <data key="d2">needs_work</data>
+  <data key="d3">Event</data>
+  <data key="d4">2026-05-24T07:15:19.082902</data>
+</node>
+<node id="Event:Interaction_session_1779599767:2322cd04">
+  <data key="d0">/model</data>
+  <data key="d1">Error calling Ollama: model 'llama3.1:8b' not found (status code: 404)
+
+My quick self-critique: Error calling Ollama: model 'llama3.1:8b' not found (s</data>
+  <data key="d2">needs_work</data>
+  <data key="d3">Event</data>
+  <data key="d4">2026-05-24T07:16:40.119849</data>
+</node>
+</graph></graphml>
