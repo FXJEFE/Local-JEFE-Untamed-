@@ -224,12 +224,19 @@ MODEL_CONFIGS: Dict[str, ModelConfig] = {
     ),
 
     # --- Models from larry_config.json ---
+    "dolphin3:8b": ModelConfig(
+        name="dolphin3:8b",
+        context_limit=32768,
+        tasks=[TaskType.CHAT, TaskType.REASONING, TaskType.CREATIVE, TaskType.AGENTIC, TaskType.ANALYSIS, TaskType.FILE_EDIT],
+        priority=1,
+        description="Default model - Dolphin 3 (Llama-3.1-8B), uncensored, strong tool use, fits RTX 4060 8GB (4.9GB)"
+    ),
     "dolphin-mixtral:8x7b": ModelConfig(
         name="dolphin-mixtral:8x7b",
         context_limit=32768,
         tasks=[TaskType.CHAT, TaskType.REASONING, TaskType.CREATIVE, TaskType.AGENTIC],
-        priority=1,
-        description="Default model - Dolphin Mixtral uncensored"
+        priority=2,
+        description="Heavy fallback - Dolphin Mixtral uncensored (26GB, CPU/partial offload)"
     ),
     "llama3.3:70b": ModelConfig(
         name="llama3.3:70b",
@@ -329,71 +336,7 @@ MODEL_CONFIGS: Dict[str, ModelConfig] = {
         priority=2,
         description="Mistral latest"
     ),
-
-    # --- Locally installed models on this machine ---
-    "qwen3-coder:latest": ModelConfig(
-        name="qwen3-coder:latest",
-        context_limit=32768,
-        tasks=[TaskType.CODING, TaskType.FILE_EDIT, TaskType.ANALYSIS, TaskType.AGENTIC],
-        priority=1,
-        description="Qwen3 Coder - primary coding/agent model (18GB)"
-    ),
-    "dolphincoder:latest": ModelConfig(
-        name="dolphincoder:latest",
-        context_limit=32768,
-        tasks=[TaskType.CODING, TaskType.FILE_EDIT, TaskType.CHAT, TaskType.CREATIVE],
-        priority=2,
-        description="DolphinCoder - fast uncensored coding model (4.2GB)"
-    ),
-    "gemma4:26b": ModelConfig(
-        name="gemma4:26b",
-        context_limit=32768,
-        tasks=[TaskType.CHAT, TaskType.REASONING, TaskType.ANALYSIS, TaskType.SUMMARIZE],
-        priority=1,
-        description="Gemma 4 26B - general reasoning/chat (17GB)"
-    ),
-    "qwen3.6:35b": ModelConfig(
-        name="qwen3.6:35b",
-        context_limit=32768,
-        tasks=[TaskType.REASONING, TaskType.ANALYSIS, TaskType.AGENTIC, TaskType.SUMMARIZE],
-        priority=1,
-        description="Qwen 3.6 35B - flagship reasoning model (23GB)"
-    ),
 }
-
-
-def _infer_config_for_unknown(name: str) -> ModelConfig:
-    """Build a sensible ModelConfig for a model not in MODEL_CONFIGS.
-
-    Looks at the model name to guess capabilities so a freshly pulled
-    model can be routed correctly without a code change.
-    """
-    n = name.lower()
-    tasks: List[TaskType] = []
-    desc = "Auto-detected installed model"
-    ctx = 8192
-
-    if "embed" in n or "embedding" in n:
-        tasks = [TaskType.EMBEDDING]
-        ctx = 512
-    elif "vl" in n.split(":")[0].split("-") or "vision" in n or "llava" in n:
-        tasks = [TaskType.VISION]
-        ctx = 8192
-    elif "coder" in n or "code" in n or "devstral" in n:
-        tasks = [TaskType.CODING, TaskType.FILE_EDIT, TaskType.ANALYSIS, TaskType.CHAT]
-        ctx = 32768
-    elif "dolphin" in n or "uncensored" in n or "abliterated" in n:
-        tasks = [TaskType.CREATIVE, TaskType.CHAT, TaskType.REASONING]
-        ctx = 32768
-    elif any(k in n for k in ("r1", "thinking", "reasoning")):
-        tasks = [TaskType.REASONING, TaskType.ANALYSIS, TaskType.SUMMARIZE, TaskType.CHAT]
-        ctx = 32768
-    else:
-        tasks = [TaskType.CHAT, TaskType.REASONING, TaskType.ANALYSIS, TaskType.SUMMARIZE]
-        ctx = 32768
-
-    return ModelConfig(name=name, context_limit=ctx, tasks=tasks,
-                       priority=5, description=desc)
 
 # Task detection keywords
 TASK_KEYWORDS = {
@@ -438,7 +381,7 @@ class ModelRouter:
         self.port = port
         self.base_url = f"http://{host}:{port}"
         self.available_models: List[str] = []
-        self.current_model: str = "llama3.2:3b"  # Default fallback
+        self.current_model: str = "dolphin-mixtral:8x7b"  # Base model for CLI
         self.refresh_models()
     
     def refresh_models(self) -> List[str]:
@@ -458,13 +401,22 @@ class ModelRouter:
         """Get detailed info about available models."""
         models_info = []
         for model_name in self.available_models:
-            config = MODEL_CONFIGS.get(model_name) or _infer_config_for_unknown(model_name)
-            models_info.append({
-                "name": model_name,
-                "context_limit": config.context_limit,
-                "tasks": [t.value for t in config.tasks],
-                "description": config.description,
-            })
+            config = MODEL_CONFIGS.get(model_name)
+            if config:
+                models_info.append({
+                    "name": model_name,
+                    "context_limit": config.context_limit,
+                    "tasks": [t.value for t in config.tasks],
+                    "description": config.description
+                })
+            else:
+                # Model not in config, add basic info
+                models_info.append({
+                    "name": model_name,
+                    "context_limit": 8192,  # Conservative default for unknown models
+                    "tasks": ["chat"],
+                    "description": "Unknown model"
+                })
         return models_info
     
     def detect_task(self, query: str) -> TaskType:
@@ -492,38 +444,34 @@ class ModelRouter:
         return TaskType.CHAT
     
     def get_model_for_task(self, task: TaskType, prefer_fast: bool = False) -> Tuple[str, ModelConfig]:
-        """Get the best available model for a task.
-
-        Considers both registered MODEL_CONFIGS and unknown installed models
-        (via _infer_config_for_unknown) so freshly pulled models work without
-        a code change.
-        """
-        candidates: List[Tuple[str, ModelConfig]] = []
-        for model_name in self.available_models:
-            config = MODEL_CONFIGS.get(model_name) or _infer_config_for_unknown(model_name)
-            if task in config.tasks:
+        """Get the best available model for a task."""
+        candidates = []
+        
+        for model_name, config in MODEL_CONFIGS.items():
+            if model_name in self.available_models and task in config.tasks:
                 candidates.append((model_name, config))
-
+        
         if not candidates:
-            # No model lists this task; fall back to any chat-capable installed model.
+            # Fallback to any available chat model
             for model_name in self.available_models:
-                config = MODEL_CONFIGS.get(model_name) or _infer_config_for_unknown(model_name)
-                if TaskType.CHAT in config.tasks:
+                config = MODEL_CONFIGS.get(model_name)
+                if config and TaskType.CHAT in config.tasks:
                     return model_name, config
-            # Truly nothing — return whatever is installed with a permissive config.
+            # Last resort
             if self.available_models:
-                first = self.available_models[0]
-                return first, _infer_config_for_unknown(first)
-            # Ollama has zero models — surface a clear error upstream.
-            raise RuntimeError(
-                "No Ollama models are installed. Run `ollama pull qwen3-coder:latest` "
-                "(or another model) before starting the agent."
-            )
-
+                return self.available_models[0], ModelConfig(
+                    name=self.available_models[0],
+                    context_limit=8192,
+                    tasks=[TaskType.CHAT],
+                    description="Fallback model"
+                )
+        
+        # Sort by priority (and context limit if prefer_fast)
         if prefer_fast:
             candidates.sort(key=lambda x: (x[1].priority, x[1].context_limit))
         else:
             candidates.sort(key=lambda x: x[1].priority)
+        
         return candidates[0]
     
     def route_query(self, query: str, prefer_fast: bool = False) -> Tuple[str, TaskType, int]:
@@ -552,19 +500,26 @@ class ModelRouter:
             return text[:max_chars] + "\n... [truncated to fit context]"
         return text
     
-    def generate(self, prompt: str, model: str = None, timeout: int = 1200, options: Dict = None) -> str:
-        """Generate response using specified or auto-routed model."""
+    def generate(self, prompt: str, model: str = None, timeout: int = 1800, options: Dict = None) -> str:
+        """Generate response using specified or auto-routed model.
+        
+        FXJEFE Local Larry: Default timeout raised significantly for long-running local model queries.
+        Complex reasoning, large context, or slow models can easily exceed 2-5 minutes.
+        """
         if model is None:
             model, task, context_limit = self.route_query(prompt)
         else:
             config = MODEL_CONFIGS.get(model)
             context_limit = config.context_limit if config else 8192
 
+        # FXJEFE: Automatic adaptable routing with token awareness
+        token_estimate = len(prompt) // 4  # rough estimate
+        logger.info(f"Task: {task.value if 'task' in locals() else 'manual'} | Estimated tokens: {token_estimate} | Selected model: {model}")
+
         # Truncate prompt if needed
         prompt = self.truncate_to_context(prompt, model)
 
-        # Build Ollama options - always set num_ctx so Ollama uses the full context window
-        # num_predict: -1 = unlimited output (don't cap response length)
+        # Build Ollama options
         ollama_options = {"num_ctx": context_limit, "num_predict": -1}
         if options:
             ollama_options.update(options)
@@ -588,7 +543,12 @@ class ModelRouter:
             else:
                 return f"Error: {response.status_code} - {response.text[:200]}"
         except requests.Timeout:
-            return f"Timeout after {timeout}s - try a faster model with /model <name>"
+            return (
+                f"Timeout after {timeout}s talking to Ollama.\n"
+                f"  - Try a faster model: /model <name>\n"
+                f"  - Or increase timeout in larry_config.json under ollama.timeout\n"
+                f"  - Make sure Ollama is still running (ollama serve or desktop app)"
+            )
         except Exception as e:
             return f"Error: {str(e)}"
     
@@ -617,15 +577,62 @@ class ModelRouter:
         logger.info(f"Switched to model: {model_name}")
         return True
 
+    def list_available_models(self):
+        """Compatibility alias used by validate_system.py and dashboards."""
+        return list(self.available_models) if hasattr(self, "available_models") else self.refresh_models()
+
 
 # Convenience functions
 _router = None
 
 def get_router() -> ModelRouter:
-    """Get or create the global model router."""
+    """Get or create the global model router.
+    
+    FXJEFE Local Larry: Extremely defensive — never returns None even under import/path hell.
+    This version is used by telegram_bot.py and root-level scripts.
+    """
     global _router
-    if _router is None:
+    if _router is not None:
+        return _router
+
+    try:
+        import json
+        from pathlib import Path
+
+        # Try multiple locations because of sys.path games in this project
+        candidates = [
+            Path(__file__).parent / "larry_config.json",
+            Path(__file__).parent.parent / "larry_config.json",
+            Path("C:/Users/LocalLarry/Documents/LocalLarry/GITHUB/larry_config.json"),
+            Path("C:/Users/LocalLarry/Documents/LocalLarry/GITHUB/config/larry_config.json"),
+        ]
+        cfg = {}
+        for c in candidates:
+            if c.exists():
+                try:
+                    cfg = json.loads(c.read_text(encoding="utf-8"))
+                    break
+                except Exception:
+                    pass
+
         _router = ModelRouter()
+    except Exception as e:
+        # Last-ditch: still return a working router object
+        logger.error(f"get_router() hard failure, creating minimal router: {e}")
+        try:
+            _router = ModelRouter()
+        except Exception:
+            # Nuclear fallback - create a dummy that won't crash the bot/agent
+            class _DummyRouter:
+                available_models = ["dolphin-mixtral:8x7b"]
+                current_model = "dolphin-mixtral:8x7b"
+                def route_query(self, q): return ("dolphin-mixtral:8x7b", "chat", 32768)
+                def detect_task(self, q): return "chat"
+                def generate(self, prompt, **kw): return "Router temporarily unavailable. Is Ollama running?"
+                def set_model(self, m): return False
+                def refresh_models(self): return []
+                def get_models_info(self): return [{"name": "dolphin-mixtral:8x7b", "context_limit": 32768, "tasks": ["chat"], "description": "Base model"}]
+            _router = _DummyRouter()
     return _router
 
 def list_models() -> str:

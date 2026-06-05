@@ -6,19 +6,30 @@
 ╚══════════════════════════════════════════════════════════════════════╝
 """
 
-import os, sys, json, subprocess, threading, time, socket, logging
-import webbrowser, shutil, psutil
+import werkzeug.serving
+from dashboard_auth import init_auth, reset_password
+from activity_stream import ActivityStream, report_status, read_status
+import os
+import sys
+import json
+import subprocess
+import threading
+import time
+import socket
+import logging
+import webbrowser
+import shutil
+import psutil
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, Optional
 
 try:
     from flask import Flask, jsonify, request, render_template_string
-    from flask_cors import CORS
 except ImportError:
-    subprocess.run([sys.executable, "-m", "pip", "install", "flask", "flask-cors", "-q"], check=True)
+    subprocess.run([sys.executable, "-m", "pip",
+                   "install", "flask", "-q"], check=True)
     from flask import Flask, jsonify, request, render_template_string
-    from flask_cors import CORS
 
 try:
     import requests as _req
@@ -28,7 +39,80 @@ except ImportError:
 logging.basicConfig(level=logging.WARNING)
 logger = logging.getLogger(__name__)
 
-from activity_stream import ActivityStream
+# ── Agent Process Manager for Command Central v4.0 ───────────────────────────
+PROJECT_ROOT = Path(__file__).parent.resolve()
+PYTHON = sys.executable
+
+AGENT_PROCESSES: Dict[str, subprocess.Popen] = {}   # "agent_v2" | "telegram_bot" → Popen
+
+def _get_agent_script(name: str) -> Path:
+    if name == "agent_v2":
+        return PROJECT_ROOT / "agent_v2.py"
+    if name == "telegram_bot":
+        # The bot lives in src/; fall back to root for older layouts.
+        src = PROJECT_ROOT / "src" / "telegram_bot.py"
+        return src if src.exists() else PROJECT_ROOT / "telegram_bot.py"
+    raise ValueError(f"Unknown agent: {name}")
+
+def start_agent(name: str) -> dict:
+    if name in AGENT_PROCESSES and AGENT_PROCESSES[name].poll() is None:
+        return {"success": False, "error": f"{name} is already running"}
+
+    script = _get_agent_script(name)
+    if not script.exists():
+        return {"success": False, "error": f"Script not found: {script}"}
+
+    try:
+        proc = subprocess.Popen(
+            [PYTHON, str(script)],
+            cwd=str(PROJECT_ROOT),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            creationflags=subprocess.CREATE_NEW_CONSOLE if os.name == "nt" else 0
+        )
+        AGENT_PROCESSES[name] = proc
+        report_status(name, status="STARTING", extra={"pid": proc.pid})
+        ActivityStream(name).emit(ActivityStream.SYSTEM, f"{name} started via Command Central (PID {proc.pid})")
+        return {"success": True, "pid": proc.pid}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+def stop_agent(name: str) -> dict:
+    if name not in AGENT_PROCESSES:
+        return {"success": False, "error": f"{name} is not being managed"}
+
+    proc = AGENT_PROCESSES[name]
+    if proc.poll() is not None:
+        del AGENT_PROCESSES[name]
+        return {"success": True, "message": "Already stopped"}
+
+    try:
+        proc.terminate()
+        try:
+            proc.wait(timeout=8)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        del AGENT_PROCESSES[name]
+        report_status(name, status="STOPPED")
+        ActivityStream(name).emit(ActivityStream.SYSTEM, f"{name} stopped via Command Central")
+        return {"success": True}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+def get_agent_status(name: str) -> dict:
+    if name not in AGENT_PROCESSES:
+        return {"running": False, "status": "STOPPED"}
+
+    proc = AGENT_PROCESSES[name]
+    alive = proc.poll() is None
+    return {
+        "running": alive,
+        "pid": proc.pid if alive else None,
+        "status": "RUNNING" if alive else "CRASHED"
+    }
+
 
 # Pre-import security modules (no app reference yet)
 try:
@@ -45,11 +129,51 @@ except Exception as _ste:
     _SEC_IMPORT_ERR = _ste
 
 PROJECT_ROOT = Path(__file__).parent.resolve()
-DASHBOARD_PORT = 3777
-HOST = "127.0.0.1"
+IS_WINDOWS = os.name == "nt"
+
+
+def _load_cfg() -> dict:
+    try:
+        return json.loads((PROJECT_ROOT / "larry_config.json").read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+_CFG = _load_cfg()
+DASHBOARD_PORT = _CFG.get("dashboard", {}).get("port", 3777)
+HOST           = _CFG.get("dashboard", {}).get("host", "127.0.0.1")
+
+
+def _get_browser_path() -> str:
+    """Return preferred browser exe path from config, or '' to use system default."""
+    browsers = _CFG.get("browser", {})
+    if IS_WINDOWS:
+        for key in ("brave_windows", "chrome_windows", "firefox_windows"):
+            p = browsers.get(key, "")
+            if p and os.path.isfile(p):
+                return p
+    else:
+        for key in ("brave_linux",):
+            p = browsers.get(key, "")
+            if p and os.path.isfile(p):
+                return p
+        for candidate in ("/usr/bin/brave-browser", "/usr/bin/chromium-browser", "/usr/bin/google-chrome"):
+            if os.path.isfile(candidate):
+                return candidate
+    return ""
+
+
+# Dual-boot aware: this PC runs both Windows and Linux. Detect at runtime and
+# keep both code paths — never assume one OS.
+
+
+def venv_python(venv_dir: Path) -> Path:
+    """Path to a venv's python interpreter, correct for the current OS."""
+    return venv_dir / ("Scripts/python.exe" if IS_WINDOWS else "bin/python")
+
 
 app = Flask(__name__)
-CORS(app)
+# No flask-cors: this is a localhost-only control panel. Cross-origin access
+# would only help an attacker. dashboard_auth adds the Host-header allowlist.
 
 # Register security routes now that app exists
 if _SEC_IMPORT_OK:
@@ -65,20 +189,46 @@ else:
         logger.warning(f"Security tools not available: {_SEC_IMPORT_ERR}")
 
 # Hide server version banner from HTTP responses
-import werkzeug.serving
 werkzeug.serving.WSGIRequestHandler.server_version = ""
 werkzeug.serving.WSGIRequestHandler.sys_version = ""
 running_services: Dict[str, subprocess.Popen] = {}
 
+# Service catalog. Each entry: script path resolved relative to cwd (or
+# PROJECT_ROOT when cwd is None). Paths point to scripts that actually exist
+# on this machine. The FXJEFE block exposes the canonical ensemble server
+# (fxjefe_main, port 47820 — what the EA calls) plus every per-model
+# microservice in FXJEFE_Project/Servers/. They all bind 127.0.0.1 only.
+_FX_SCRIPTS = str(PROJECT_ROOT / "FXJEFE_Project" / "Scripts")
+_FX_SERVERS = str(PROJECT_ROOT / "FXJEFE_Project" / "Servers")
 AVAILABLE_SERVICES = {
-    "agent_larry":   {"name": "Larry Agent CLI",     "script": "agent_v2.py",                "port": None, "icon": "🤖", "cwd": None, "terminal": True},
-    "telegram_bot":  {"name": "Telegram Bot",        "script": "telegram_bot.py",            "port": None, "icon": "✈️",  "cwd": None},
-    "xgboost_api":   {"name": "XGBoost API",         "script": "xgboost_predictions_api.py", "port": 5562, "icon": "📈", "cwd": None},
-    "ai_server":     {"name": "AI Server",           "script": "ai_servernwew.py",           "port": 5000, "icon": "🧠", "cwd": None},
-    "fxjefe_main":   {"name": "FXJEFE Trading",      "script": "fxjefe_main_server.py",      "port": 8080, "icon": "💹", "cwd": None},
-    "crypto_ai":     {"name": "Crypto AI Server",    "script": "crypto_ai_server.py",        "port": 8081, "icon": "🔮", "cwd": str(Path.home() / "cryptobot")},
-    "crypto_bot":    {"name": "Crypto Bot (Binance)","script": "crypto_bot.py",              "port": None, "icon": "💰", "cwd": str(Path.home() / "cryptobot"), "args": ["--live"]},
-    "security_sentinel": {"name": "Security Sentinel","script": "security_sentinel.py",      "port": None, "icon": "🛡️", "cwd": None},
+    "agent_larry":       {"name": "Larry Agent CLI",   "script": "agent_v2.py",          "port": None,  "icon": "🤖", "cwd": str(PROJECT_ROOT), "terminal": True},
+    "telegram_bot":      {"name": "Telegram Bot",      "script": "src/telegram_bot.py",  "port": None,  "icon": "✈️",  "cwd": str(PROJECT_ROOT)},
+    "security_sentinel": {"name": "Security Sentinel", "script": "security_sentinel.py", "port": None,  "icon": "🛡️", "cwd": str(PROJECT_ROOT)},
+
+    # Full-stack launcher: ensures venv+deps+config, starts Ollama with the
+    # Larry-Fast-9b tool model, then the Telegram bot, and supervises them.
+    # The file lives in launchers/ but we set cwd=launchers/ so the script
+    # basename appears in the process cmdline for _find_running_pid().
+    "larry_fullstack":   {"name": "Larry Full Stack",  "script": "start_fullstack.py",   "port": None,  "icon": "🟢", "cwd": str(PROJECT_ROOT / "launchers")},
+
+    # Setup + startup of THIS exact configured version, runnable from the UI.
+    # Setup: build/select interpreter + deps, pull qwen3:8b, snapshot VERSION_STATE.json.
+    # Startup: bring up dashboard + full stack together (the boot/login entry point).
+    "larry_setup":       {"name": "Setup (this version)",  "script": "setup_larry_version.py", "port": None, "icon": "🧩", "cwd": str(PROJECT_ROOT / "launchers"), "terminal": True},
+    "larry_startup":     {"name": "Startup (full system)", "script": "start_system.py", "args": ["--no-browser"], "port": None, "icon": "🏁", "cwd": str(PROJECT_ROOT / "launchers")},
+
+    # FXJEFE canonical ensemble server (the EA calls this one).
+    "fxjefe_main":       {"name": "AI Server (ensemble)", "script": "ai_server_golden.py", "port": 47820, "icon": "💹", "cwd": _FX_SCRIPTS},
+
+    # FXJEFE per-model microservices — start a single one, several, or the
+    # whole fleet via the orchestrator below.
+    "fxjefe_xgboost":    {"name": "XGBoost server",   "script": "xgboost_server.py",    "port": 47826, "icon": "📈", "cwd": _FX_SERVERS},
+    "fxjefe_lstm":       {"name": "LSTM server",      "script": "lstm_server.py",       "port": 47822, "icon": "🧬", "cwd": _FX_SERVERS},
+    "fxjefe_ltdm":       {"name": "LTDM server",      "script": "ltdm_server.py",       "port": 47823, "icon": "📊", "cwd": _FX_SERVERS},
+    "fxjefe_hmm":        {"name": "HMM server",       "script": "hmm_server.py",        "port": 47824, "icon": "🌀", "cwd": _FX_SERVERS},
+    "fxjefe_nn":         {"name": "NN server",        "script": "nn_server.py",         "port": 47825, "icon": "🧠", "cwd": _FX_SERVERS},
+    "fxjefe_ml":         {"name": "ML orchestrator",  "script": "ml_server.py",         "port": 47821, "icon": "🎛️", "cwd": _FX_SERVERS},
+    "fxjefe_orchestrator": {"name": "Fleet orchestrator", "script": "orchestrator.py", "args": ["start"], "port": None, "icon": "🚀", "cwd": _FX_SERVERS},
 }
 
 # DB folder for prompts/scripts/apps
@@ -100,11 +250,15 @@ TEMP_LABELS = {
 # SYSTEM DATA COLLECTORS
 # ═══════════════════════════════════════════════════════════════════════
 
+
 def get_system_health():
     try:
-        cpu = psutil.cpu_percent(interval=0.3)
+        # interval=None returns 0.0 on the first call (no delta yet); a short
+        # blocking sample gives a real CPU% reading on every poll.
+        cpu = psutil.cpu_percent(interval=0.2)
         mem = psutil.virtual_memory()
-        disk = psutil.disk_usage('/')
+        # OS-correct root (C:\ or /)
+        disk = psutil.disk_usage(PROJECT_ROOT.anchor)
         temps = {}
         try:
             t = psutil.sensors_temperatures()
@@ -115,7 +269,8 @@ def get_system_health():
         except Exception:
             pass
         net = psutil.net_io_counters()
-        boot_time = datetime.fromtimestamp(psutil.boot_time()).strftime("%Y-%m-%d %H:%M")
+        boot_time = datetime.fromtimestamp(
+            psutil.boot_time()).strftime("%Y-%m-%d %H:%M")
         uptime_s = int(time.time() - psutil.boot_time())
         h, r = divmod(uptime_s, 3600)
         m = r // 60
@@ -138,6 +293,7 @@ def get_system_health():
         }
     except Exception as e:
         return {"error": str(e)}
+
 
 def get_gpu_info():
     try:
@@ -163,6 +319,7 @@ def get_gpu_info():
     except Exception:
         return []
 
+
 def get_ollama_models():
     if _req is None:
         return []
@@ -178,6 +335,7 @@ def get_ollama_models():
     except Exception:
         return []
 
+
 def get_ollama_running():
     """Which model is currently loaded in VRAM."""
     if _req is None:
@@ -187,6 +345,7 @@ def get_ollama_running():
         return [m.get("name", "") for m in r.json().get("models", [])]
     except Exception:
         return []
+
 
 def get_public_ip():
     """Get public IP address (goes through VPN if active)."""
@@ -198,8 +357,10 @@ def get_public_ip():
     except Exception:
         return "--"
 
+
 def get_network_info():
-    info = {"interfaces": [], "connections": 0, "listening_ports": [], "active_connections": [], "public_ip": "--"}
+    info = {"interfaces": [], "connections": 0, "listening_ports": [],
+            "active_connections": [], "public_ip": "--"}
     try:
         for iface, addrs in psutil.net_if_addrs().items():
             stats = psutil.net_if_stats().get(iface)
@@ -245,6 +406,7 @@ def get_network_info():
     info["public_ip"] = get_public_ip()
     return info
 
+
 def get_vpn_status():
     """Detect common VPN interfaces."""
     vpn_ifaces = []
@@ -253,10 +415,12 @@ def get_vpn_status():
             low = iface.lower()
             if any(x in low for x in ["tun", "tap", "wg", "vpn", "proton", "nordlynx", "mullvad", "ovpn"]):
                 stats = psutil.net_if_stats().get(iface)
-                vpn_ifaces.append({"name": iface, "up": stats.isup if stats else False})
+                vpn_ifaces.append(
+                    {"name": iface, "up": stats.isup if stats else False})
     except Exception:
         pass
     return vpn_ifaces
+
 
 def get_telegram_status():
     """Check if telegram_bot.py is running."""
@@ -268,6 +432,7 @@ def get_telegram_status():
         except Exception:
             pass
     return {"running": False, "pid": None}
+
 
 def run_nmap_quick(target: str = "10.0.0.0/24"):
     """Fast nmap ping sweep. Requires nmap installed."""
@@ -290,6 +455,7 @@ def run_nmap_quick(target: str = "10.0.0.0/24"):
         return {"error": "Scan timed out"}
     except Exception as e:
         return {"error": str(e)}
+
 
 def run_port_scan(target: str = "localhost", ports: str = "1-1024"):
     if not shutil.which("nmap"):
@@ -323,29 +489,65 @@ def run_port_scan(target: str = "localhost", ports: str = "1-1024"):
                 state = parts[1]
                 service = parts[2] if len(parts) > 2 else ""
                 version = " ".join(parts[3:]) if len(parts) > 3 else ""
-                open_ports.append({"port": int(port), "state": state, "service": service, "version": version[:40]})
+                open_ports.append(
+                    {"port": int(port), "state": state, "service": service, "version": version[:40]})
         return {"target": target, "ports": ports, "open": open_ports, "count": len(open_ports)}
     except subprocess.TimeoutExpired:
         return {"error": "Scan timed out (try a smaller port range)"}
     except Exception as e:
         return {"error": str(e)}
 
+
+_proc_cache: dict = {"ts": 0.0, "data": []}
+_PROC_TTL = 5.0  # seconds between full process scans
+
 def get_top_processes(n=10):
-    # Normalize CPU% to % of the whole system (like Task Manager); psutil sums
-    # across all logical cores, so a busy process can read >100% otherwise.
-    ncpu = psutil.cpu_count() or 1
-    candidates = [p for p in psutil.process_iter(["pid","name","cpu_percent","memory_percent","status"])
-                  if p.info.get("pid") and (p.info.get("name") or "") != "System Idle Process"]
+    now = time.time()
+    if now - _proc_cache["ts"] < _PROC_TTL:
+        return _proc_cache["data"]
     procs = []
-    for p in sorted(candidates, key=lambda x: x.info.get("cpu_percent") or 0, reverse=True)[:n]:
-        procs.append({
-            "pid": p.info["pid"],
-            "name": (p.info.get("name") or "?")[:20],
-            "cpu": round((p.info.get("cpu_percent") or 0) / ncpu, 1),
-            "mem": round(p.info.get("memory_percent") or 0, 1),
-            "status": p.info.get("status", ""),
-        })
+    try:
+        # First pass: touch every process so psutil can start measuring CPU delta
+        snap = list(psutil.process_iter(["pid", "name", "cpu_percent", "memory_percent", "status"]))
+        for p in snap:
+            try:
+                p.cpu_percent()  # prime the counter (returns 0, discarded)
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+        # Brief interval so the second call returns a real delta
+        time.sleep(0.15)
+        # Normalize per-process CPU to a share of the WHOLE machine. psutil
+        # reports CPU per-core, so a single busy thread can read >100%; dividing
+        # by the logical-CPU count keeps every row in 0-100% and matches the
+        # system CPU gauge.
+        ncpu = psutil.cpu_count() or 1
+        # Second pass: read actual values
+        rows = []
+        for p in snap:
+            try:
+                pid = p.info["pid"]
+                # PID 0 ("System Idle Process" on Windows / swapper on Linux) is
+                # not a real, killable process — its "CPU%" is just unused
+                # capacity (it reads near ncpu*100%). Never list it.
+                if pid == 0 or (p.info.get("name") or "") == "System Idle Process":
+                    continue
+                cpu = (p.cpu_percent() or 0) / ncpu
+                rows.append({
+                    "pid": pid,
+                    "name": (p.info.get("name") or "")[:20],
+                    "cpu": round(cpu, 1),
+                    "mem": round(p.info.get("memory_percent") or 0, 1),
+                    "status": p.info.get("status", ""),
+                })
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+        procs = sorted(rows, key=lambda x: x["cpu"], reverse=True)[:n]
+    except Exception:
+        pass
+    _proc_cache["ts"] = time.time()
+    _proc_cache["data"] = procs
     return procs
+
 
 def get_listening_services():
     """Get listening services with PID and process name."""
@@ -376,32 +578,58 @@ def get_listening_services():
 # API ROUTES
 # ═══════════════════════════════════════════════════════════════════════
 
+
 @app.route("/api/health")
 def api_health():
     return jsonify({"system": get_system_health(), "gpu": get_gpu_info(),
                     "processes": get_top_processes()})
 
+
 @app.route("/api/ollama")
 def api_ollama():
     return jsonify({"models": get_ollama_models(), "running": get_ollama_running()})
+
 
 @app.route("/api/network")
 def api_network():
     return jsonify({**get_network_info(), "vpn": get_vpn_status(),
                     "telegram": get_telegram_status()})
 
+
+def _find_running_pid(script_name: str) -> Optional[int]:
+    """Scan psutil for a python process running script_name."""
+    try:
+        for p in psutil.process_iter(["pid", "name", "cmdline"]):
+            try:
+                cmd = p.info.get("cmdline") or []
+                if any(script_name in str(a) for a in cmd):
+                    return p.info["pid"]
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+    except Exception:
+        pass
+    return None
+
+
 @app.route("/api/services/status")
 def api_services_status():
     out = {}
     for sid, sinfo in AVAILABLE_SERVICES.items():
         proc = running_services.get(sid)
+        managed_running = proc is not None and proc.poll() is None
+        # Also detect processes started outside the dashboard (or after a restart)
+        ext_pid = None
+        if not managed_running:
+            ext_pid = _find_running_pid(sinfo["script"])
         out[sid] = {
-            "running": proc is not None and proc.poll() is None,
+            "running": managed_running or (ext_pid is not None),
+            "pid": (proc.pid if managed_running else ext_pid),
             "port": sinfo["port"],
             "name": sinfo["name"],
             "icon": sinfo["icon"],
         }
     return jsonify({"services": out})
+
 
 @app.route("/api/services/<sid>/start", methods=["POST"])
 def api_start_service(sid):
@@ -411,6 +639,9 @@ def api_start_service(sid):
     proc = running_services.get(sid)
     if proc and proc.poll() is None:
         return jsonify({"success": False, "error": "Already running"}), 400
+    ext_pid = _find_running_pid(sinfo["script"])
+    if ext_pid:
+        return jsonify({"success": False, "error": f"Already running (external PID {ext_pid})"}), 400
     work_dir = Path(sinfo["cwd"]) if sinfo.get("cwd") else PROJECT_ROOT
     script = work_dir / sinfo["script"]
     if not script.exists():
@@ -426,8 +657,15 @@ def api_start_service(sid):
 
         # Interactive services need a real terminal window
         if sinfo.get("terminal"):
-            # Try gnome-terminal, then xterm as fallback
-            term_bin = shutil.which("gnome-terminal") or shutil.which("xfce4-terminal") or shutil.which("xterm")
+            if IS_WINDOWS:
+                # Windows: launch the interactive service in its own console.
+                p = subprocess.Popen([py, str(script)], cwd=str(work_dir), env=env,
+                                     creationflags=subprocess.CREATE_NEW_CONSOLE)
+                running_services[sid] = p
+                return jsonify({"success": True, "message": f"{sinfo['name']} opened in a console (PID {p.pid})"})
+            # Linux: find a terminal emulator (gnome-terminal, then xterm).
+            term_bin = shutil.which(
+                "gnome-terminal") or shutil.which("xfce4-terminal") or shutil.which("xterm")
             if not term_bin:
                 return jsonify({"success": False, "error": "No terminal emulator found (gnome-terminal/xterm)"}), 500
             title = sinfo["name"]
@@ -456,16 +694,17 @@ def api_start_service(sid):
             return jsonify({"success": True, "message": f"{sinfo['name']} opened in terminal (PID {p.pid})"})
 
         # Background/daemon services
-        log_dir = work_dir / "Logs"
+        log_dir = PROJECT_ROOT / "logs"
         log_dir.mkdir(parents=True, exist_ok=True)
         log_out = open(log_dir / f"{sid}.log", "a")
         cmd = [py, str(script)] + sinfo.get("args", [])
         p = subprocess.Popen(cmd, cwd=str(work_dir),
-                              stdout=log_out, stderr=log_out, env=env)
+                             stdout=log_out, stderr=log_out, env=env)
         running_services[sid] = p
         return jsonify({"success": True, "message": f"{sinfo['name']} started (PID {p.pid})"})
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
+
 
 @app.route("/api/services/<sid>/stop", methods=["POST"])
 def api_stop_service(sid):
@@ -480,6 +719,7 @@ def api_stop_service(sid):
     del running_services[sid]
     return jsonify({"success": True})
 
+
 @app.route("/api/process/kill", methods=["POST"])
 def api_kill_process():
     """Kill a process by PID. Sends SIGTERM first, SIGKILL after 3s."""
@@ -489,8 +729,9 @@ def api_kill_process():
         return jsonify({"success": False, "error": "No PID provided"}), 400
     try:
         pid = int(pid)
-        # Safety: never kill PID 1, own PID, or dashboard PID
-        if pid in (1, os.getpid(), os.getppid()):
+        # Safety: never kill OS pseudo-processes (0 = System Idle, 4 = System),
+        # PID 1, own PID, or the dashboard's parent.
+        if pid in (0, 1, 4, os.getpid(), os.getppid()):
             return jsonify({"success": False, "error": "Protected process"}), 403
         proc = psutil.Process(pid)
         name = proc.name()
@@ -519,8 +760,8 @@ def api_ollama_unload():
         return jsonify({"success": False, "error": "No model specified"}), 400
     try:
         r = _req.post("http://localhost:11434/api/generate",
-                       json={"model": model, "prompt": "", "keep_alive": 0},
-                       timeout=10)
+                      json={"model": model, "prompt": "", "keep_alive": 0},
+                      timeout=10)
         return jsonify({"success": True, "message": f"Unloaded {model} from VRAM"})
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
@@ -622,6 +863,73 @@ def api_listening():
     return jsonify({"services": get_listening_services()})
 
 
+LOGS_DIR = PROJECT_ROOT / "logs"
+
+@app.route("/api/logs")
+def api_logs():
+    """Return the last N lines from all log files in logs/."""
+    n = min(int(request.args.get("lines", 80)), 500)
+    log_file = request.args.get("file", "")
+    lines_out = []
+    try:
+        if log_file:
+            candidates = [LOGS_DIR / log_file]
+        else:
+            candidates = sorted(
+                (f for f in LOGS_DIR.iterdir() if f.suffix in (".log", ".jsonl") and f.is_file()),
+                key=lambda f: f.stat().st_mtime, reverse=True
+            )[:4]
+        for path in candidates:
+            if not path.exists():
+                continue
+            try:
+                with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                    raw = fh.readlines()
+                tail = raw[-n:] if len(raw) > n else raw
+                for ln in tail:
+                    lines_out.append({"file": path.name, "line": ln.rstrip()})
+            except Exception:
+                pass
+    except Exception as e:
+        return jsonify({"error": str(e), "lines": []})
+    return jsonify({"lines": lines_out[-n:]})
+
+
+@app.route("/api/telegram/status")
+def api_telegram_status():
+    """Live view of active long prompt sessions and heavy tasks from the Telegram bot."""
+    status_file = PROJECT_ROOT / "logs" / "telegram_live_status.json"
+    if not status_file.exists():
+        return jsonify({
+            "timestamp": datetime.now().isoformat(),
+            "active_sessions": 0,
+            "heavy_tasks": [],
+            "long_prompt_builders": {},
+            "heavy_task_details": {},
+            "message": "No live data yet (start telegram_bot.py)"
+        })
+
+    try:
+        data = json.loads(status_file.read_text(encoding="utf-8"))
+        return jsonify(data)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/logs/files")
+def api_logs_files():
+    """List available log files."""
+    try:
+        files = [
+            {"name": f.name, "size": f.stat().st_size, "mtime": f.stat().st_mtime}
+            for f in sorted(LOGS_DIR.iterdir(), key=lambda x: x.stat().st_mtime, reverse=True)
+            if f.suffix in (".log", ".jsonl") and f.is_file()
+        ]
+    except Exception:
+        files = []
+    return jsonify({"files": files})
+
+
 @app.route("/api/chat/save", methods=["POST"])
 def api_chat_save():
     """Save chat conversation to db/chats."""
@@ -633,7 +941,8 @@ def api_chat_save():
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     fname = f"chat_{model.replace(':', '-')}_{ts}.json"
     target = DB_ROOT / "chats" / fname
-    target.write_text(json.dumps({"model": model, "timestamp": ts, "messages": messages}, indent=2), encoding="utf-8")
+    target.write_text(json.dumps(
+        {"model": model, "timestamp": ts, "messages": messages}, indent=2), encoding="utf-8")
     return jsonify({"success": True, "file": fname})
 
 
@@ -646,7 +955,8 @@ def api_chat_history():
         if f.is_file() and f.suffix == ".json":
             try:
                 meta = json.loads(f.read_text(encoding="utf-8"))
-                files.append({"name": f.name, "model": meta.get("model", "?"), "count": len(meta.get("messages", []))})
+                files.append({"name": f.name, "model": meta.get(
+                    "model", "?"), "count": len(meta.get("messages", []))})
             except Exception:
                 files.append({"name": f.name, "model": "?", "count": 0})
     return jsonify({"chats": files[:30]})
@@ -680,7 +990,8 @@ def api_kali_run():
     if not shutil.which(cmd[0]):
         return jsonify({"error": f"{cmd[0]} not installed. Run: sudo apt install {cmd[0]}"}), 404
     try:
-        out = subprocess.check_output(cmd, timeout=60, text=True, stderr=subprocess.STDOUT)
+        out = subprocess.check_output(
+            cmd, timeout=60, text=True, stderr=subprocess.STDOUT)
         return jsonify({"output": out[:10000], "tool": tool, "target": target})
     except subprocess.TimeoutExpired:
         return jsonify({"error": f"{tool} timed out (60s limit)"})
@@ -701,7 +1012,8 @@ def api_security_quickscan():
         for c in conns:
             if c.status == "LISTEN" and c.laddr:
                 listen_ports.add(c.laddr.port)
-        results.append({"check": "Listening Ports", "status": "info", "detail": f"{len(listen_ports)} ports open: {sorted(listen_ports)[:15]}"})
+        results.append({"check": "Listening Ports", "status": "info",
+                       "detail": f"{len(listen_ports)} ports open: {sorted(listen_ports)[:15]}"})
     except Exception:
         pass
     # Check SSH
@@ -709,11 +1021,14 @@ def api_security_quickscan():
         auth_log = Path("/var/log/auth.log")
         if auth_log.exists():
             lines = auth_log.read_text(errors="replace").splitlines()[-200:]
-            fails = sum(1 for l in lines if "Failed password" in l or "authentication failure" in l)
+            fails = sum(
+                1 for l in lines if "Failed password" in l or "authentication failure" in l)
             status = "warn" if fails > 5 else "ok"
-            results.append({"check": "SSH Brute-Force", "status": status, "detail": f"{fails} failed attempts in recent log"})
+            results.append({"check": "SSH Brute-Force", "status": status,
+                           "detail": f"{fails} failed attempts in recent log"})
     except PermissionError:
-        results.append({"check": "SSH Brute-Force", "status": "info", "detail": "Cannot read auth.log (need root)"})
+        results.append({"check": "SSH Brute-Force", "status": "info",
+                       "detail": "Cannot read auth.log (need root)"})
     except Exception:
         pass
     # Check VPN
@@ -724,12 +1039,15 @@ def api_security_quickscan():
             if stats and stats.isup:
                 vpn_up = True
                 break
-    results.append({"check": "VPN Status", "status": "ok" if vpn_up else "warn", "detail": "VPN active" if vpn_up else "NO VPN — traffic unprotected"})
+    results.append({"check": "VPN Status", "status": "ok" if vpn_up else "warn",
+                   "detail": "VPN active" if vpn_up else "NO VPN — traffic unprotected"})
     # Check resources
-    cpu = psutil.cpu_percent(interval=0.5)
+    cpu = psutil.cpu_percent(interval=None)
     mem = psutil.virtual_memory().percent
-    results.append({"check": "CPU Load", "status": "warn" if cpu > 85 else "ok", "detail": f"{cpu:.0f}%"})
-    results.append({"check": "Memory", "status": "warn" if mem > 90 else "ok", "detail": f"{mem:.0f}%"})
+    results.append({"check": "CPU Load", "status": "warn" if cpu >
+                   85 else "ok", "detail": f"{cpu:.0f}%"})
+    results.append({"check": "Memory", "status": "warn" if mem >
+                   90 else "ok", "detail": f"{mem:.0f}%"})
     # Check critical files
     for path in ["/etc/passwd", "/etc/shadow", "/etc/sudoers"]:
         p = Path(path)
@@ -739,11 +1057,14 @@ def api_security_quickscan():
                 mode = p.stat().st_mode
                 world_readable = bool(mode & stat.S_IROTH)
                 if path == "/etc/shadow" and world_readable:
-                    results.append({"check": f"File: {path}", "status": "critical", "detail": "WORLD READABLE — fix permissions!"})
+                    results.append({"check": f"File: {path}", "status": "critical",
+                                   "detail": "WORLD READABLE — fix permissions!"})
                 else:
-                    results.append({"check": f"File: {path}", "status": "ok", "detail": f"Permissions: {oct(mode)[-3:]}"})
+                    results.append({"check": f"File: {path}", "status": "ok",
+                                   "detail": f"Permissions: {oct(mode)[-3:]}"})
             except PermissionError:
-                results.append({"check": f"File: {path}", "status": "ok", "detail": "Access restricted (normal)"})
+                results.append({"check": f"File: {path}", "status": "ok",
+                               "detail": "Access restricted (normal)"})
     return jsonify({"results": results, "timestamp": datetime.now().strftime("%H:%M:%S")})
 
 
@@ -756,273 +1077,610 @@ def api_activity_stream():
     return jsonify({"events": events})
 
 
-# ═══════════════════════════════════════════════════════════════════════
-# CRYPTO TRADING API
-# ═══════════════════════════════════════════════════════════════════════
-
-CRYPTOBOT_DIR = Path.home() / "cryptobot"
-CRYPTO_STATE_FILE = CRYPTOBOT_DIR / "data" / "Trades" / "crypto" / "bot_state.json"
-CRYPTO_CONFIG_FILE = CRYPTOBOT_DIR / "crypto_config.json"
-
-def _crypto_bot_state():
-    """Read crypto bot state file."""
-    try:
-        if CRYPTO_STATE_FILE.exists():
-            with open(CRYPTO_STATE_FILE) as f:
-                return json.load(f)
-    except Exception:
-        pass
-    return {}
-
-def _crypto_config():
-    """Read crypto config."""
-    try:
-        if CRYPTO_CONFIG_FILE.exists():
-            with open(CRYPTO_CONFIG_FILE) as f:
-                return json.load(f)
-    except Exception:
-        pass
-    return {}
-
-def _crypto_bot_running():
-    """Check if crypto_bot.py --live is running."""
-    result = {"running": False, "pid": None, "live": False}
-    for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+@app.route("/api/agent/status")
+def api_agent_status():
+    """Return current status of Agent v2, Telegram Bot, etc. for Command Central."""
+    status = ActivityStream.read_status() if hasattr(ActivityStream, "read_status") else {}
+    # Fallback: also read from file directly
+    if not status:
         try:
-            cmd = proc.info.get('cmdline') or []
-            cmd_str = ' '.join(cmd)
-            if 'crypto_bot.py' in cmd_str:
-                is_live = '--live' in cmd_str
-                is_python = (proc.info.get('name') or '').startswith('python')
-                # Prefer the actual python process over bash wrappers
-                if is_python or not result["running"]:
-                    result = {"running": True, "pid": proc.info['pid'],
-                              "live": is_live or result.get("live", False)}
+            from activity_stream import read_status as _read
+            status = _read()
+        except Exception:
+            status = {}
+    return jsonify(status)
+
+
+# ── Agent Control Endpoints (Start/Stop from UI) ──────────────────────────────
+@app.route("/api/agent/control", methods=["POST"])
+def api_agent_control():
+    data = request.get_json() or {}
+    name = data.get("name")          # "agent_v2" or "telegram_bot"
+    action = data.get("action")      # "start" or "stop"
+
+    if name not in ("agent_v2", "telegram_bot"):
+        return jsonify({"success": False, "error": "Invalid agent name"}), 400
+
+    if action == "start":
+        result = start_agent(name)
+    elif action == "stop":
+        result = stop_agent(name)
+    else:
+        return jsonify({"success": False, "error": "Invalid action"}), 400
+
+    return jsonify(result)
+
+
+@app.route("/api/agent/status")
+def api_agent_full_status():
+    """Enhanced status including managed processes + last known state."""
+    status = read_status() if 'read_status' in globals() else ActivityStream.read_status()
+
+    for name in ("agent_v2", "telegram_bot"):
+        live = get_agent_status(name)
+        if name not in status:
+            status[name] = {}
+        status[name].update(live)
+
+    return jsonify(status)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# FXJEFE / MT5 + CONTROL API
+# ═══════════════════════════════════════════════════════════════════════
+
+# FXJEFE_Project sits next to this dashboard. Resolve it relative to here so
+# the same code works on both the Windows and Linux boot of this PC.
+FXJEFE_ROOT = PROJECT_ROOT / "FXJEFE_Project"
+FXJEFE_SCRIPTS = FXJEFE_ROOT / "Scripts"
+FXJEFE_VENV = FXJEFE_ROOT / ".venv"
+AI_SERVER_SCRIPT = "ai_server_golden.py"       # canonical AI server
+# must match config.json main_server
+AI_SERVER_URL = "http://127.0.0.1:47820"
+PIPELINE_SCRIPT = "pipelinerun.py"
+
+
+def _fxjefe_python():
+    """FXJEFE venv interpreter if present, else this process's python."""
+    vp = venv_python(FXJEFE_VENV)
+    return str(vp) if vp.exists() else sys.executable
+
+
+# --- MetaTrader5 account reader -------------------------------------------
+# The MetaTrader5 package is Windows-only. On Linux the import fails and the
+# panel cleanly reports "unavailable" instead of crashing the dashboard.
+try:
+    import MetaTrader5 as _mt5
+    MT5_AVAILABLE = True
+except Exception:
+    _mt5 = None
+    MT5_AVAILABLE = False
+
+_mt5_lock = threading.Lock()
+_mt5_cache = {
+    "available": MT5_AVAILABLE,
+    "connected": False,
+    "reason": "" if MT5_AVAILABLE
+              else "MetaTrader5 is Windows-only - this panel is live when booted into Windows",
+}
+
+
+def _mt5_terminal_running() -> bool:
+    """True only if an MT5/FTMO terminal is ALREADY running.
+
+    Every _mt5.initialize() call is gated on this, because initialize() will
+    LAUNCH the terminal if it isn't running. The dashboard must NEVER auto-start
+    MT5 / FTMO — the user opens it themselves.
+    """
+    try:
+        for p in psutil.process_iter(["name", "exe"]):
+            try:
+                name = (p.info.get("name") or "").lower()
+                if name in ("terminal64.exe", "terminal.exe",
+                            "metatrader.exe", "metatrader5.exe"):
+                    return True
+                exe = (p.info.get("exe") or "").lower()
+                if "metatrader" in exe or "ftmo" in exe or "terminal64" in exe:
+                    return True
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+    except Exception:
+        pass
+    return False
+
+
+def _mt5_poll_once():
+    """One MetaTrader5 read into a snapshot dict. Runs on the poller thread."""
+    snap = {"available": True, "connected": False, "reason": "",
+            "updated": datetime.now().strftime("%H:%M:%S")}
+    try:
+        if not _mt5_terminal_running():
+            snap["reason"] = "MT5 terminal not open (auto-launch disabled)"
+        elif not _mt5.initialize():
+            snap["reason"] = "MT5 terminal not running"
+        else:
+            acc = _mt5.account_info()
+            if acc is None:
+                snap["reason"] = "MT5 terminal running but not logged in"
+            else:
+                positions = []
+                for p in (_mt5.positions_get() or []):
+                    positions.append({
+                        "ticket": p.ticket,
+                        "symbol": p.symbol,
+                        "type": "BUY" if p.type == 0 else "SELL",
+                        "volume": p.volume,
+                        "open": p.price_open,
+                        "current": p.price_current,
+                        "profit": round(p.profit, 2),
+                    })
+                snap.update({
+                    "connected": True,
+                    "login": acc.login, "server": acc.server,
+                    "currency": acc.currency, "leverage": acc.leverage,
+                    "balance": round(acc.balance, 2),
+                    "equity": round(acc.equity, 2),
+                    "profit": round(acc.profit, 2),          # floating P/L
+                    "margin": round(acc.margin, 2),
+                    "margin_free": round(acc.margin_free, 2),
+                    "margin_level": round(acc.margin_level, 1) if acc.margin else 0.0,
+                    "positions": positions,
+                    "n_positions": len(positions),
+                })
+    except Exception as e:
+        snap["reason"] = f"MT5 error: {e}"
+    with _mt5_lock:
+        _mt5_cache.clear()
+        _mt5_cache.update(snap)
+
+
+def _mt5_poller():
+    while True:
+        try:
+            _mt5_poll_once()
+        except Exception as e:
+            logger.warning(f"MT5 poll failed: {e}")
+        time.sleep(3)
+
+
+if MT5_AVAILABLE:
+    threading.Thread(target=_mt5_poller, daemon=True).start()
+
+
+@app.route("/api/mt5/status")
+def api_mt5_status():
+    """Live MT5 account snapshot.
+    Tries to connect on-demand if the poller hasn't succeeded yet.
+    """
+    with _mt5_lock:
+        cache = dict(_mt5_cache)
+
+    # If we have the package but not connected, try a quick one-shot init
+    if (MT5_AVAILABLE and _mt5 is not None and not cache.get("connected")
+            and _mt5_terminal_running()):
+        try:
+            with _mt5_lock:
+                if not _mt5.initialize():
+                    cache["reason"] = "MT5 terminal not running or not logged in"
+                else:
+                    acc = _mt5.account_info()
+                    if acc:
+                        cache["connected"] = True
+                        cache["login"] = acc.login
+                        cache["server"] = acc.server
+                        cache["balance"] = round(acc.balance, 2)
+                        cache["equity"] = round(acc.equity, 2)
+                        cache["profit"] = round(acc.profit, 2)
+                        cache["margin"] = round(acc.margin, 2)
+                        cache["margin_free"] = round(acc.margin_free, 2)
+                        cache["leverage"] = acc.leverage
+                        cache["currency"] = acc.currency
+                        cache["n_positions"] = len(_mt5.positions_get() or [])
+                        cache["updated"] = datetime.now().strftime("%H:%M:%S")
+                        cache["reason"] = ""
+                    else:
+                        cache["reason"] = "MT5 connected but no account info (not logged in?)"
+        except Exception as e:
+            cache["reason"] = f"MT5 error: {str(e)[:100]}"
+
+    return jsonify(cache)
+
+
+@app.route("/api/mt5/connect", methods=["POST"])
+def api_mt5_connect():
+    """Force reconnect to the running MT5 terminal (useful after MT5 restart/login)."""
+    if not MT5_AVAILABLE or _mt5 is None:
+        return jsonify({"success": False, "error": "MetaTrader5 package not available"}), 400
+
+    # Never launch the terminal. Require the user to have MT5/FTMO open first.
+    if not _mt5_terminal_running():
+        return jsonify({"success": False,
+                        "error": "MT5/FTMO terminal is not open. Open and log in first — the dashboard will not launch it."}), 409
+
+    with _mt5_lock:
+        try:
+            _mt5.shutdown()  # clean previous session if any
+            if not _mt5.initialize():
+                return jsonify({"success": False, "error": "MT5.initialize() failed. Is the MT5 terminal running and logged in?"}), 500
+            acc = _mt5.account_info()
+            if acc is None:
+                return jsonify({"success": False, "error": "Connected to MT5 but no account info (not logged in?)"}), 500
+
+            # Force an immediate poll so the cache is fresh
+            _mt5_poll_once()
+            return jsonify({"success": True, "message": f"MT5 reconnected — {acc.login} @ {acc.server}"})
+        except Exception as e:
+            return jsonify({"success": False, "error": str(e)}), 500
+
+
+# --- FXJEFE control: restart AI server, run pipeline, health --------------
+def _kill_ai_server():
+    """Terminate whatever process is serving the AI server (port 8080)."""
+    killed = []
+    for proc in psutil.process_iter(["pid", "cmdline"]):
+        try:
+            cmd = " ".join(proc.info.get("cmdline") or [])
+            if "ai_server_golden.py" in cmd or "fxjefe_main_server.py" in cmd:
+                proc.terminate()
+                killed.append(proc.info["pid"])
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             pass
-    return result
+    return killed
 
-def _crypto_ai_running():
-    """Check if crypto_ai_server.py is running and healthy."""
-    for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+
+@app.route("/api/fxjefe/restart-ai", methods=["POST"])
+def api_fxjefe_restart_ai():
+    """Stop and relaunch the canonical port-8080 AI server."""
+    script = FXJEFE_SCRIPTS / AI_SERVER_SCRIPT
+    if not script.exists():
+        return jsonify({"success": False, "error": f"Not found: {script}"}), 404
+    killed = _kill_ai_server()
+    time.sleep(1.5)
+    try:
+        log_dir = FXJEFE_ROOT / "Logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_out = open(log_dir / "ai_server_golden.log", "a")
+        p = subprocess.Popen([_fxjefe_python(), str(script)],
+                             cwd=str(FXJEFE_SCRIPTS), stdout=log_out, stderr=log_out)
+        running_services["fxjefe_main"] = p
+        return jsonify({"success": True,
+                        "message": f"AI server restarted (PID {p.pid}); stopped {killed or 'nothing'}"})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/api/fxjefe/run-pipeline", methods=["POST"])
+def api_fxjefe_run_pipeline():
+    """Launch the FXJEFE pipeline detached - it is long-running."""
+    script = FXJEFE_SCRIPTS / PIPELINE_SCRIPT
+    if not script.exists():
+        return jsonify({"success": False, "error": f"Not found: {script}"}), 404
+    proc = running_services.get("fxjefe_pipeline")
+    if proc and proc.poll() is None:
+        return jsonify({"success": False, "error": "Pipeline already running"}), 400
+    try:
+        log_dir = FXJEFE_ROOT / "Logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_out = open(log_dir / "pipeline.log", "a")
+        p = subprocess.Popen([_fxjefe_python(), str(script)],
+                             cwd=str(FXJEFE_SCRIPTS), stdout=log_out, stderr=log_out)
+        running_services["fxjefe_pipeline"] = p
+        return jsonify({"success": True,
+                        "message": f"Pipeline started (PID {p.pid}) - watch pipeline.log"})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/api/fxjefe/health")
+def api_fxjefe_health():
+    """Proxy the AI server's /health (server-side, avoids browser CORS)."""
+    if _req is None:
+        return jsonify({"ok": False, "error": "requests not installed"}), 500
+    try:
+        r = _req.get(f"{AI_SERVER_URL}/health", timeout=4)
+        return jsonify({"ok": True, "status_code": r.status_code, "health": r.json()})
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"AI server not reachable: {e}"})
+
+
+# --- MT5 manual trade: open, close one, close all ------------------------
+def _close_one(ticket):
+    """Close a single open position by ticket. Returns (ok, message). Caller
+    must hold _mt5_lock and have a live mt5 connection."""
+    pos_list = _mt5.positions_get(ticket=ticket)
+    if not pos_list:
+        return False, f"position {ticket} not found"
+    p = pos_list[0]
+    tick = _mt5.symbol_info_tick(p.symbol)
+    if tick is None:
+        return False, f"no tick for {p.symbol}"
+    if p.type == _mt5.POSITION_TYPE_BUY:
+        order_type, price = _mt5.ORDER_TYPE_SELL, tick.bid
+    else:
+        order_type, price = _mt5.ORDER_TYPE_BUY, tick.ask
+    req = {
+        "action": _mt5.TRADE_ACTION_DEAL,
+        "position": ticket,
+        "symbol": p.symbol,
+        "volume": p.volume,
+        "type": order_type,
+        "price": price,
+        "deviation": 20,
+        "magic": p.magic,
+        "comment": "dashboard close",
+        "type_time": _mt5.ORDER_TIME_GTC,
+        "type_filling": _mt5.ORDER_FILLING_IOC,
+    }
+    result = _mt5.order_send(req)
+    if result is None:
+        return False, "order_send returned None"
+    if result.retcode != _mt5.TRADE_RETCODE_DONE:
+        return False, f"retcode {result.retcode}: {result.comment}"
+    return True, f"closed {ticket} ({p.symbol} {p.volume})"
+
+
+@app.route("/api/mt5/trade", methods=["POST"])
+def api_mt5_trade():
+    """Open a manual MT5 trade. Body: {symbol, side: 'BUY'|'SELL', volume,
+    sl?, tp?, comment?}. Magic is 0 so the EA's management loops ignore it."""
+    if not MT5_AVAILABLE:
+        return jsonify({"success": False, "error": "MetaTrader5 not available on this OS"}), 503
+    data = request.get_json(force=True) or {}
+    symbol = str(data.get("symbol", "")).upper().strip()
+    side = str(data.get("side", "")).upper().strip()
+    try:
+        volume = float(data.get("volume", 0))
+    except (TypeError, ValueError):
+        volume = 0
+    if not symbol or side not in ("BUY", "SELL") or volume <= 0:
+        return jsonify({"success": False, "error": "Need symbol, side (BUY/SELL), volume>0"}), 400
+    with _mt5_lock:
         try:
-            cmd = proc.info.get('cmdline') or []
-            if any('crypto_ai_server.py' in c for c in cmd):
-                healthy = False
-                if _req:
-                    try:
-                        r = _req.get("http://127.0.0.1:8081/health", timeout=2)
-                        healthy = r.status_code == 200
-                    except Exception:
-                        pass
-                return {"running": True, "pid": proc.info['pid'], "healthy": healthy}
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
-            pass
-    return {"running": False, "pid": None, "healthy": False}
+            if not _mt5_terminal_running():
+                return jsonify({"success": False, "error": "MT5/FTMO terminal is not open — open it first (dashboard will not launch it)"}), 409
+            if not _mt5.initialize():
+                return jsonify({"success": False, "error": "MT5 not running"}), 503
+            if not _mt5.symbol_select(symbol, True):
+                return jsonify({"success": False, "error": f"Unknown symbol {symbol}"}), 400
+            tick = _mt5.symbol_info_tick(symbol)
+            if tick is None:
+                return jsonify({"success": False, "error": f"No tick for {symbol}"}), 400
+            price = tick.ask if side == "BUY" else tick.bid
+            req = {
+                "action": _mt5.TRADE_ACTION_DEAL,
+                "symbol": symbol,
+                "volume": volume,
+                "type": _mt5.ORDER_TYPE_BUY if side == "BUY" else _mt5.ORDER_TYPE_SELL,
+                "price": price,
+                "deviation": 20,
+                "magic": 0,
+                "comment": str(data.get("comment", "dashboard"))[:30],
+                "type_time": _mt5.ORDER_TIME_GTC,
+                "type_filling": _mt5.ORDER_FILLING_IOC,
+            }
+            if data.get("sl"):
+                req["sl"] = float(data["sl"])
+            if data.get("tp"):
+                req["tp"] = float(data["tp"])
+            result = _mt5.order_send(req)
+            if result is None:
+                return jsonify({"success": False, "error": "order_send returned None"}), 500
+            if result.retcode != _mt5.TRADE_RETCODE_DONE:
+                return jsonify({"success": False, "retcode": result.retcode,
+                                "error": result.comment}), 400
+            return jsonify({"success": True, "ticket": result.order, "deal": result.deal,
+                            "price": result.price, "volume": result.volume,
+                            "message": f"{side} {volume} {symbol} @ {result.price}"})
+        except Exception as e:
+            return jsonify({"success": False, "error": str(e)}), 500
 
-def _crypto_log_tail(n=30):
-    """Get last N lines from the most recent bot log."""
-    log_dir = CRYPTOBOT_DIR / "Logs" / "crypto"
+
+@app.route("/api/mt5/close", methods=["POST"])
+def api_mt5_close():
+    """Close one open position by ticket. Body: {ticket}."""
+    if not MT5_AVAILABLE:
+        return jsonify({"success": False, "error": "MetaTrader5 not available on this OS"}), 503
     try:
-        logs = sorted(log_dir.glob("bot_*.log"), key=lambda f: f.stat().st_mtime, reverse=True)
-        if logs:
-            lines = logs[0].read_text(errors='replace').strip().splitlines()
-            return lines[-n:]
-    except Exception:
-        pass
-    # Fallback to nohup log
-    fallback = Path("/tmp/crypto_bot_live.log")
+        ticket = int((request.get_json(force=True) or {}).get("ticket", 0))
+    except (TypeError, ValueError):
+        ticket = 0
+    if ticket <= 0:
+        return jsonify({"success": False, "error": "Need ticket"}), 400
+    with _mt5_lock:
+        try:
+            if not _mt5_terminal_running():
+                return jsonify({"success": False, "error": "MT5/FTMO terminal is not open — open it first (dashboard will not launch it)"}), 409
+            if not _mt5.initialize():
+                return jsonify({"success": False, "error": "MT5 not running"}), 503
+            ok, msg = _close_one(ticket)
+            if ok:
+                return jsonify({"success": True, "message": msg})
+            return jsonify({"success": False, "error": msg}), 400
+        except Exception as e:
+            return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/api/mt5/close_all", methods=["POST"])
+def api_mt5_close_all():
+    """Close every open MT5 position (manual + EA-managed)."""
+    if not MT5_AVAILABLE:
+        return jsonify({"success": False, "error": "MetaTrader5 not available on this OS"}), 503
+    with _mt5_lock:
+        try:
+            if not _mt5_terminal_running():
+                return jsonify({"success": False, "error": "MT5/FTMO terminal is not open — open it first (dashboard will not launch it)"}), 409
+            if not _mt5.initialize():
+                return jsonify({"success": False, "error": "MT5 not running"}), 503
+            positions = _mt5.positions_get() or []
+            if not positions:
+                return jsonify({"success": True, "closed": 0, "total": 0, "message": "No open positions"})
+            results, closed = [], 0
+            for p in positions:
+                ok, msg = _close_one(p.ticket)
+                results.append(msg)
+                if ok:
+                    closed += 1
+            return jsonify({"success": closed == len(positions), "closed": closed,
+                            "total": len(positions), "results": results})
+        except Exception as e:
+            return jsonify({"success": False, "error": str(e)}), 500
+
+
+# --- MCP server catalog --------------------------------------------------
+# The agent's MCP config. On this machine it lives at the repo root
+# (GITHUB/mcp.json); other layouts kept it under LocalLarry/ or config/ or a
+# Documents mirror. Resolve to whichever actually exists so the panel works.
+def _resolve_mcp_config() -> Path:
+    for c in (PROJECT_ROOT / "mcp.json",
+              PROJECT_ROOT / "config" / "mcp.json",
+              PROJECT_ROOT / "LocalLarry" / "mcp.json",
+              Path.home() / "Documents" / "mcp.json"):
+        if c.exists():
+            return c
+    return PROJECT_ROOT / "mcp.json"
+
+MCP_CONFIG_PATH = _resolve_mcp_config()
+
+
+def _mcp_dep_status(server):
+    """Best-effort check for whether a server's external dependency exists.
+    Returns one of: 'ready', 'needs-token', 'missing-binary', 'service-down',
+    'unknown'. Pure-Python lookups only - no network calls."""
+    name = server.get("name", "")
+    params = server.get("params") or {}
+    if name in ("filesystem", "time", "memory", "sqlite", "context7"):
+        return "ready"
+    if name == "playwright":
+        return "ready" if (PROJECT_ROOT / ".venv" / "Scripts" / "playwright.exe").exists() \
+            or shutil.which("playwright") else "missing-binary"
+    if name == "podman":
+        return "ready" if shutil.which("podman") else "missing-binary"
+    if name == "n8n":
+        return "service-down"  # we don't poll; user starts n8n separately
+    if name == "desktop-commander":
+        return "ready" if IS_WINDOWS else "missing-binary"
+    # http transports / brave / github: just check the api_key env var
+    env_key = params.get("api_key_env")
+    if env_key:
+        return "ready" if os.environ.get(env_key) else "needs-token"
+    return "unknown"
+
+
+@app.route("/api/mcp/list")
+def api_mcp_list():
+    """Return the MCP catalog + per-server enabled flag + dependency status."""
     try:
-        if fallback.exists():
-            lines = fallback.read_text(errors='replace').strip().splitlines()
-            return lines[-n:]
-    except Exception:
-        pass
-    return []
+        with open(MCP_CONFIG_PATH, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+        servers = []
+        for s in cfg.get("servers", []):
+            servers.append({
+                "name": s.get("name"),
+                "enabled": bool(s.get("enabled")),
+                "transport": s.get("transport"),
+                "description": s.get("description"),
+                "dep_status": _mcp_dep_status(s),
+            })
+        n_enabled = sum(1 for s in servers if s["enabled"])
+        return jsonify({"ok": True, "config_path": str(MCP_CONFIG_PATH),
+                        "count": len(servers), "enabled": n_enabled, "servers": servers})
+    except FileNotFoundError:
+        return jsonify({"ok": False, "error": f"mcp.json not found at {MCP_CONFIG_PATH}"}), 404
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
 
-@app.route("/api/crypto/status")
-def api_crypto_status():
-    """Full crypto trading status: state, config, servers, log tail."""
-    st = _crypto_bot_state()
-    cfg = _crypto_config()
-    bot = _crypto_bot_running()
-    ai = _crypto_ai_running()
-    log_lines = _crypto_log_tail(40)
 
-    # Parse open positions for display
-    positions = st.get("open_positions", {})
-    closed = st.get("closed_trades", [])
+@app.route("/api/health/services")
+def api_health_services():
+    """Compact Agent / Ollama / MCP health for the panel below GPU STATUS."""
+    # --- Agent: any of the agent-family processes alive? ---
+    agent_pids = {}
+    for label, script in (("agent", "agent_v2.py"),
+                          ("fullstack", "start_fullstack.py"),
+                          ("telegram", "telegram_bot.py")):
+        pid = _find_running_pid(script)
+        if pid:
+            agent_pids[label] = pid
+    agent_up = bool(agent_pids)
+
+    # --- Ollama: reachable? how many models? what's loaded in VRAM? ---
+    ollama_up = False
+    model_count = 0
+    if _req is not None:
+        try:
+            r = _req.get("http://localhost:11434/api/tags", timeout=3)
+            ollama_up = r.status_code == 200
+            model_count = len(r.json().get("models", []))
+        except Exception:
+            ollama_up = False
+    loaded = get_ollama_running() if ollama_up else []
+
+    # --- MCP: enabled / dependency-ready counts from mcp.json ---
+    mcp = {"ok": False, "enabled": 0, "count": 0, "ready": 0}
+    try:
+        with open(MCP_CONFIG_PATH, "r", encoding="utf-8") as f:
+            mcfg = json.load(f)
+        servers = mcfg.get("servers", [])
+        enabled = [s for s in servers if s.get("enabled")]
+        ready = [s for s in enabled if _mcp_dep_status(s) == "ready"]
+        mcp = {"ok": True, "count": len(servers),
+               "enabled": len(enabled), "ready": len(ready)}
+    except Exception as e:
+        mcp = {"ok": False, "error": str(e), "enabled": 0, "count": 0, "ready": 0}
 
     return jsonify({
-        "bot": bot,
-        "ai_server": ai,
-        "balance": st.get("equity_hwm", 0) if not bot["running"] else None,
-        "state": {
-            "start_of_day_balance": st.get("start_of_day_balance", 0),
-            "equity_hwm": st.get("equity_hwm", 0),
-            "total_pnl": round(st.get("total_pnl", 0), 2),
-            "n_trades": st.get("n_trades", 0),
-            "n_wins": st.get("n_wins", 0),
-            "win_rate": round(100 * st.get("n_wins", 0) / max(st.get("n_trades", 1), 1), 1),
-            "open_positions": positions,
-            "n_open": len(positions),
-            "recent_trades": closed[-10:] if closed else [],
-        },
-        "config": {
-            "exchange": cfg.get("exchange", {}).get("name", "?"),
-            "paper": cfg.get("bot", {}).get("paper_trading", True),
-            "symbols": [s.get("base", "?") for s in cfg.get("symbols", [])],
-            "n_symbols": len(cfg.get("symbols", [])),
-            "risk_per_trade": cfg.get("risk", {}).get("risk_per_trade_pct", 0),
-            "max_dd": cfg.get("risk", {}).get("max_daily_drawdown_pct", 0),
-            "max_positions": cfg.get("risk", {}).get("max_open_positions", 0),
-            "min_confidence": cfg.get("risk", {}).get("min_confidence", 0),
-            "primary_tf": cfg.get("primary_timeframe", "?"),
-        },
-        "log": log_lines,
+        "agent":  {"up": agent_up, "pids": agent_pids},
+        "ollama": {"up": ollama_up, "loaded": loaded, "models": model_count,
+                   "default_model": _CFG.get("ollama", {}).get("default_model", "")},
+        "mcp": mcp,
+        "ts": datetime.now().strftime("%H:%M:%S"),
     })
 
-@app.route("/api/crypto/log")
-def api_crypto_log():
-    """Return last N lines of bot log."""
-    n = int(request.args.get("n", 50))
-    return jsonify({"lines": _crypto_log_tail(n)})
 
-@app.route("/api/crypto/pipeline/<action>", methods=["POST"])
-def api_crypto_pipeline(action):
-    """Start/stop crypto pipeline components: ai_server, bot, fetch_data."""
-    cryptobot_dir = str(CRYPTOBOT_DIR)
-    venv_py = CRYPTOBOT_DIR / "venv" / "bin" / "python"
-    py = str(venv_py) if venv_py.exists() else sys.executable
-    env = os.environ.copy()
-    # Load .env from cryptobot dir
-    env_file = CRYPTOBOT_DIR / ".env"
-    if env_file.exists():
-        for line in env_file.read_text().splitlines():
-            line = line.strip()
-            if line and not line.startswith('#') and '=' in line:
-                k, v = line.split('=', 1)
-                env[k.strip()] = v.strip()
-
-    if action == "start_all":
-        results = []
-        # Start AI server
-        ai = _crypto_ai_running()
-        if not ai["running"]:
-            log_dir = CRYPTOBOT_DIR / "Logs"
-            log_dir.mkdir(parents=True, exist_ok=True)
-            log_out = open(log_dir / "crypto_ai.log", "a")
-            p = subprocess.Popen([py, str(CRYPTOBOT_DIR / "crypto_ai_server.py")],
-                                  cwd=cryptobot_dir, stdout=log_out, stderr=log_out, env=env)
-            running_services["crypto_ai"] = p
-            results.append(f"AI Server started (PID {p.pid})")
-        else:
-            results.append(f"AI Server already running (PID {ai['pid']})")
-        # Start bot
-        bot = _crypto_bot_running()
-        if not bot["running"]:
-            log_out2 = open(CRYPTOBOT_DIR / "Logs" / "crypto_bot.log", "a")
-            p2 = subprocess.Popen([py, str(CRYPTOBOT_DIR / "crypto_bot.py"), "--live"],
-                                   cwd=cryptobot_dir, stdout=log_out2, stderr=log_out2, env=env)
-            running_services["crypto_bot"] = p2
-            results.append(f"Bot started LIVE (PID {p2.pid})")
-        else:
-            results.append(f"Bot already running (PID {bot['pid']}, live={bot['live']})")
-        return jsonify({"success": True, "results": results})
-
-    elif action == "stop_all":
-        results = []
-        for name in ["crypto_bot", "crypto_ai"]:
-            proc = running_services.get(name)
-            if proc and proc.poll() is None:
-                proc.terminate()
-                try:
-                    proc.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                del running_services[name]
-                results.append(f"{name} stopped")
-            else:
-                # Try to find and kill by process scan
-                for p in psutil.process_iter(['pid', 'cmdline']):
-                    try:
-                        cmd = p.info.get('cmdline') or []
-                        script_name = "crypto_bot.py" if name == "crypto_bot" else "crypto_ai_server.py"
-                        if any(script_name in c for c in cmd):
-                            psutil.Process(p.info['pid']).terminate()
-                            results.append(f"{name} killed (PID {p.info['pid']})")
-                    except Exception:
-                        pass
-        return jsonify({"success": True, "results": results})
-
-    elif action == "start_ai":
-        ai = _crypto_ai_running()
-        if ai["running"]:
-            return jsonify({"success": False, "error": f"Already running (PID {ai['pid']})"}), 400
-        log_out = open(CRYPTOBOT_DIR / "Logs" / "crypto_ai.log", "a")
-        p = subprocess.Popen([py, str(CRYPTOBOT_DIR / "crypto_ai_server.py")],
-                              cwd=cryptobot_dir, stdout=log_out, stderr=log_out, env=env)
-        running_services["crypto_ai"] = p
-        return jsonify({"success": True, "message": f"AI Server started (PID {p.pid})"})
-
-    elif action == "stop_ai":
-        for p in psutil.process_iter(['pid', 'cmdline']):
-            try:
-                cmd = p.info.get('cmdline') or []
-                if any('crypto_ai_server.py' in c for c in cmd):
-                    psutil.Process(p.info['pid']).terminate()
-                    running_services.pop("crypto_ai", None)
-                    return jsonify({"success": True, "message": f"AI Server stopped (PID {p.info['pid']})"})
-            except Exception:
-                pass
-        return jsonify({"success": False, "error": "Not running"}), 400
-
-    elif action == "start_bot":
-        bot = _crypto_bot_running()
-        if bot["running"]:
-            return jsonify({"success": False, "error": f"Already running (PID {bot['pid']})"}), 400
-        log_out = open(CRYPTOBOT_DIR / "Logs" / "crypto_bot.log", "a")
-        p = subprocess.Popen([py, str(CRYPTOBOT_DIR / "crypto_bot.py"), "--live"],
-                              cwd=cryptobot_dir, stdout=log_out, stderr=log_out, env=env)
-        running_services["crypto_bot"] = p
-        return jsonify({"success": True, "message": f"Bot started LIVE (PID {p.pid})"})
-
-    elif action == "stop_bot":
-        for p in psutil.process_iter(['pid', 'cmdline']):
-            try:
-                cmd = p.info.get('cmdline') or []
-                if any('crypto_bot.py' in c for c in cmd):
-                    psutil.Process(p.info['pid']).terminate()
-                    running_services.pop("crypto_bot", None)
-                    return jsonify({"success": True, "message": f"Bot stopped (PID {p.info['pid']})"})
-            except Exception:
-                pass
-        return jsonify({"success": False, "error": "Not running"}), 400
-
-    elif action == "fetch_data":
-        # Run data fetcher in background thread
-        def _fetch():
-            try:
-                log_out = open(CRYPTOBOT_DIR / "Logs" / "data_fetch_dash.log", "w")
-                subprocess.run([py, str(CRYPTOBOT_DIR / "crypto_data_fetcher.py")],
-                               cwd=cryptobot_dir, stdout=log_out, stderr=log_out, env=env, timeout=600)
-            except Exception as e:
-                logger.error(f"Data fetch failed: {e}")
-        threading.Thread(target=_fetch, daemon=True).start()
-        return jsonify({"success": True, "message": "Data fetch started in background"})
-
-    return jsonify({"success": False, "error": f"Unknown action: {action}"}), 400
+@app.route("/api/mcp/toggle", methods=["POST"])
+def api_mcp_toggle():
+    """Flip the 'enabled' flag for one MCP server. Body: {name, enabled}.
+    Writes both the LocalLarry and Documents copies so they stay in sync."""
+    data = request.get_json(force=True) or {}
+    name = str(data.get("name", "")).strip()
+    enabled = bool(data.get("enabled"))
+    if not name:
+        return jsonify({"success": False, "error": "Need 'name'"}), 400
+    paths = [MCP_CONFIG_PATH, PROJECT_ROOT / "mcp.json"]
+    updated = []
+    for p in paths:
+        if not p.exists():
+            continue
+        try:
+            cfg = json.loads(p.read_text(encoding="utf-8"))
+            hit = False
+            for s in cfg.get("servers", []):
+                if s.get("name") == name:
+                    s["enabled"] = enabled
+                    hit = True
+            if hit:
+                p.write_text(json.dumps(cfg, indent=4), encoding="utf-8")
+                updated.append(str(p))
+        except Exception as e:
+            return jsonify({"success": False, "error": f"{p}: {e}"}), 500
+    if not updated:
+        return jsonify({"success": False, "error": f"Server '{name}' not in any mcp.json"}), 404
+    return jsonify({"success": True, "name": name, "enabled": enabled, "files": updated,
+                    "message": f"{name} {'enabled' if enabled else 'disabled'} - restart agent_larry to apply"})
 
 
 @app.route("/api/nmap/sweep", methods=["POST"])
 def api_nmap_sweep():
-    target = request.json.get("target", "192.168.1.0/24") if request.is_json else "192.168.1.0/24"
+    target = request.json.get(
+        "target", "192.168.1.0/24") if request.is_json else "192.168.1.0/24"
     return jsonify(run_nmap_quick(target))
+
 
 @app.route("/api/nmap/ports", methods=["POST"])
 def api_nmap_ports():
     data = request.json or {}
     return jsonify(run_port_scan(data.get("target", "localhost"), data.get("ports", "1-1024")))
+
 
 @app.route("/api/ollama/chat", methods=["POST"])
 def api_ollama_chat():
@@ -1038,7 +1696,8 @@ def api_ollama_chat():
         resp = r.json().get("response", "")
         # Emit activity event for dashboard chat usage
         stream = ActivityStream("dashboard_chat")
-        stream.emit(ActivityStream.GENERATING, f"Chat: {model}", {"model": model, "prompt_len": len(prompt)})
+        stream.emit(ActivityStream.GENERATING, f"Chat: {model}", {
+                    "model": model, "prompt_len": len(prompt)})
         return jsonify({"response": resp, "model": model})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -1046,6 +1705,7 @@ def api_ollama_chat():
 # ═══════════════════════════════════════════════════════════════════════
 # BASH SCRIPT RUNNER API
 # ═══════════════════════════════════════════════════════════════════════
+
 
 @app.route("/api/bash/list")
 def api_bash_list():
@@ -1071,7 +1731,8 @@ def api_bash_run():
         return jsonify({"success": False, "error": "Invalid script key"}), 400
 
     stream = ActivityStream("dashboard_bash")
-    stream.emit(ActivityStream.TOOL_DISPATCH, f"Bash: {key} {' '.join(extra_args)}")
+    stream.emit(ActivityStream.TOOL_DISPATCH,
+                f"Bash: {key} {' '.join(extra_args)}")
 
     def _run_bg():
         result = _bash_runner.run(key, extra_args=extra_args or None,
@@ -1151,7 +1812,8 @@ def api_agent_dispatch():
                 }
                 for keywords, subcmd in sec_map.items():
                     if any(kw in task_lower for kw in keywords):
-                        stream.emit(ActivityStream.TOOL_DISPATCH, f"Security: {subcmd}")
+                        stream.emit(ActivityStream.TOOL_DISPATCH,
+                                    f"Security: {subcmd}")
                         result = _sec_center.handle_command("security", subcmd)
                         stream.emit(ActivityStream.RESPONSE_DONE, f"Security/{subcmd} done",
                                     {"preview": result[:200]})
@@ -1167,8 +1829,10 @@ def api_agent_dispatch():
                 }
                 for keywords, key in bash_map.items():
                     if any(kw in task_lower for kw in keywords):
-                        stream.emit(ActivityStream.TOOL_DISPATCH, f"Bash: {key}")
-                        result = _bash_runner.run(key, stream_output=False, capture=True)
+                        stream.emit(ActivityStream.TOOL_DISPATCH,
+                                    f"Bash: {key}")
+                        result = _bash_runner.run(
+                            key, stream_output=False, capture=True)
                         status = "Done" if result.get("success") else "Failed"
                         stream.emit(ActivityStream.RESPONSE_DONE, f"Bash/{key} {status}",
                                     {"exit_code": result.get("exit_code")})
@@ -1177,7 +1841,8 @@ def api_agent_dispatch():
             # ── Kali tool dispatch ────────────────────────────────────
             from kali_tools import TOOLS, parse_args_with_preset, run_tool
             # Attempt to match "run <toolname> [target]" pattern
-            m = _re.search(r'\b(?:run|use|execute)\s+(\w+)\s+(.+)', task, _re.I)
+            m = _re.search(
+                r'\b(?:run|use|execute)\s+(\w+)\s+(.+)', task, _re.I)
             if m:
                 tool_name = m.group(1).lower()
                 tool_args = m.group(2).strip()
@@ -1185,7 +1850,8 @@ def api_agent_dispatch():
                     tool_obj = TOOLS[tool_name]
                     expanded = parse_args_with_preset(tool_obj, tool_args)
                     if not expanded.startswith("__ERROR__"):
-                        stream.emit(ActivityStream.TOOL_DISPATCH, f"Kali: {tool_name} {tool_args[:40]}")
+                        stream.emit(ActivityStream.TOOL_DISPATCH,
+                                    f"Kali: {tool_name} {tool_args[:40]}")
                         success, output = run_tool(tool_name, expanded)
                         status = "Done" if success else "Finished"
                         stream.emit(ActivityStream.RESPONSE_DONE, f"Kali/{tool_name} {status}",
@@ -1202,14 +1868,18 @@ def api_agent_dispatch():
                         f"Respond with a brief, actionable answer about what security steps to take."
                     )
                     r = _req.post("http://localhost:11434/api/generate",
-                                  json={"model": "dolphinecoder:15b", "prompt": prompt, "stream": False},
+                                  json={"model": "dolphinecoder:15b",
+                                        "prompt": prompt, "stream": False},
                                   timeout=60)
                     resp = r.json().get("response", "No response from model")
-                    stream.emit(ActivityStream.RESPONSE_DONE, f"LLM response: {resp[:100]}")
+                    stream.emit(ActivityStream.RESPONSE_DONE,
+                                f"LLM response: {resp[:100]}")
                 except Exception as llm_e:
-                    stream.emit(ActivityStream.ERROR, f"LLM fallback failed: {llm_e}")
+                    stream.emit(ActivityStream.ERROR,
+                                f"LLM fallback failed: {llm_e}")
             else:
-                stream.emit(ActivityStream.ERROR, f"No matching handler for: {task[:60]}")
+                stream.emit(ActivityStream.ERROR,
+                            f"No matching handler for: {task[:60]}")
 
         except Exception as e:
             stream.emit(ActivityStream.ERROR, f"Dispatch error: {e}")
@@ -1633,10 +2303,103 @@ header::after {
       </div>
     </div>
 
-    <!-- ══ SYSTEM MONITOR (moved to top): Top Processes · GPU · Heat ══ -->
+    <!-- ══ FXJEFE TRADING PANEL ══════════════════════════════════ -->
+    <div class="panel" style="margin-bottom:12px;border:1px solid rgba(0,200,255,0.3)">
+      <div class="panel-title" style="border-bottom:1px solid rgba(0,200,255,0.2);padding-bottom:8px;margin-bottom:10px">
+        <span class="icon">💹</span> FXJEFE TRADING — MT5
+        <span style="margin-left:auto;display:flex;gap:6px;align-items:center">
+          <span class="badge badge-off" id="mt5-conn-badge" style="padding:2px 8px">--</span>
+          <span class="badge" id="mt5-account-badge" style="padding:2px 8px">--</span>
+        </span>
+      </div>
+
+      <!-- MT5 account KPIs -->
+      <div class="grid-4" style="margin-bottom:10px">
+        <div class="stat-card clipped" data-label="EQUITY" style="border-color:rgba(0,200,255,0.3)">
+          <div class="stat-val color-cyan" id="mt5-equity" style="font-size:1.6rem">$--</div>
+          <div class="stat-sub">BALANCE: <span id="mt5-balance">--</span></div>
+        </div>
+        <div class="stat-card clipped" data-label="FLOATING P/L" style="border-color:rgba(0,255,136,0.3)">
+          <div class="stat-val" id="mt5-pnl" style="font-size:1.6rem">$--</div>
+          <div class="stat-sub">MARGIN: <span id="mt5-margin">--</span></div>
+        </div>
+        <div class="stat-card clipped" data-label="MARGIN LEVEL" style="border-color:rgba(240,180,40,0.3)">
+          <div class="stat-val color-gold" id="mt5-margin-level" style="font-size:1.6rem">--</div>
+          <div class="stat-sub">FREE: <span id="mt5-margin-free">--</span></div>
+        </div>
+        <div class="stat-card clipped" data-label="OPEN POSITIONS" style="border-color:rgba(0,200,255,0.3)">
+          <div class="stat-val color-cyan" id="mt5-positions" style="font-size:1.6rem">0</div>
+          <div class="stat-sub">LEV <span id="mt5-leverage">--</span> | <span id="mt5-server">--</span></div>
+        </div>
+      </div>
+
+      <div style="font-family:'Share Tech Mono';font-size:0.68rem;color:var(--cyan);margin-bottom:6px;text-transform:uppercase;letter-spacing:1px">Open Positions</div>
+      <div id="mt5-open-positions" style="font-family:'Share Tech Mono';font-size:0.7rem;margin-bottom:6px;min-height:26px">
+        <span class="color-dim">No open positions</span>
+      </div>
+      <div id="mt5-updated" style="font-family:'Share Tech Mono';font-size:0.62rem;color:var(--dim)">--</div>
+
+      <!-- FXJEFE controls -->
+      <div style="margin-top:10px;padding-top:8px;border-top:1px solid rgba(0,200,255,0.15);display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+        <span style="font-family:'Share Tech Mono';font-size:0.68rem;color:var(--dim);margin-right:6px">CONTROL:</span>
+        <button class="btn btn-sm" style="background:rgba(0,200,255,0.15);color:var(--cyan);border:1px solid rgba(0,200,255,0.3)" onclick="fxAction('restart-ai','Restart AI server')">↻ RESTART AI SERVER</button>
+        <button class="btn btn-green btn-sm" onclick="fxAction('run-pipeline','Run the FXJEFE pipeline')">▶ RUN PIPELINE</button>
+        <button class="btn btn-sm" style="background:rgba(240,180,40,0.15);color:var(--gold);border:1px solid rgba(240,180,40,0.3)" onclick="fxHealth()">✚ HEALTH</button>
+        <span id="fx-control-msg" style="font-family:'Share Tech Mono';font-size:0.65rem;color:var(--dim);margin-left:8px"></span>
+      </div>
+      <div id="fx-health-out" style="font-family:'Share Tech Mono';font-size:0.62rem;color:var(--dim);margin-top:6px;white-space:pre-wrap"></div>
+
+      <!-- Manual MT5 trade -->
+      <div style="margin-top:10px;padding-top:8px;border-top:1px solid rgba(0,200,255,0.15)">
+        <div style="font-family:'Share Tech Mono';font-size:0.68rem;color:var(--cyan);margin-bottom:6px;text-transform:uppercase;letter-spacing:1px">Manual Trade</div>
+        <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;font-family:'Share Tech Mono';font-size:0.7rem">
+          <input id="trd-sym" placeholder="EURUSD" style="width:90px;background:#0a0e14;border:1px solid #1f2a3a;color:#cdd6e4;border-radius:4px;padding:5px 7px">
+          <input id="trd-vol" placeholder="vol" value="0.01" style="width:60px;background:#0a0e14;border:1px solid #1f2a3a;color:#cdd6e4;border-radius:4px;padding:5px 7px">
+          <input id="trd-sl" placeholder="SL (optional)" style="width:110px;background:#0a0e14;border:1px solid #1f2a3a;color:#cdd6e4;border-radius:4px;padding:5px 7px">
+          <input id="trd-tp" placeholder="TP (optional)" style="width:110px;background:#0a0e14;border:1px solid #1f2a3a;color:#cdd6e4;border-radius:4px;padding:5px 7px">
+          <button class="btn btn-green btn-sm" onclick="mt5Trade('BUY')">&#9650; BUY</button>
+          <button class="btn btn-red btn-sm" onclick="mt5Trade('SELL')">&#9660; SELL</button>
+          <button class="btn btn-sm" style="background:rgba(255,84,112,0.15);color:var(--red);border:1px solid rgba(255,84,112,0.35)" onclick="mt5CloseAll()">&#9632; CLOSE ALL</button>
+          <span id="trd-msg" style="font-family:'Share Tech Mono';font-size:0.65rem;color:var(--dim);margin-left:6px"></span>
+        </div>
+      </div>
+    </div>
+
+    <!-- ══ MCP SERVERS PANEL ═════════════════════════════════════ -->
+    <div class="panel" style="margin-bottom:12px;border:1px solid rgba(160,120,255,0.25)">
+      <div class="panel-title" style="border-bottom:1px solid rgba(160,120,255,0.18);padding-bottom:8px;margin-bottom:10px">
+        <span class="icon">🔌</span> MCP TOOLS — AGENT CONNECTORS
+        <span style="margin-left:auto;display:flex;gap:6px;align-items:center">
+          <span class="badge" id="mcp-summary-badge" style="padding:2px 8px">--</span>
+          <button class="btn btn-sm" style="padding:2px 8px;font-size:0.6rem;background:rgba(160,120,255,0.15);color:#c9b6ff;border:1px solid rgba(160,120,255,0.3)" onclick="refreshMCP()">↻</button>
+        </span>
+      </div>
+      <div id="mcp-list" style="font-family:'Share Tech Mono';font-size:0.72rem;min-height:30px">
+        <span class="color-dim">Loading MCP catalog...</span>
+      </div>
+      <div style="font-family:'Share Tech Mono';font-size:0.6rem;color:var(--dim);margin-top:6px">
+        Toggling a server rewrites mcp.json. Restart <b>agent_larry</b> from the Services tab to apply.
+      </div>
+    </div>
+
     <div class="grid-main">
       <div>
-        <!-- Top Processes (CPU + MEM) -->
+        <!-- GPU Detail -->
+        <div class="panel" style="margin-bottom:12px">
+          <div class="panel-title"><span class="icon">⚡</span> GPU STATUS</div>
+          <div id="gpu-detail"><span class="color-dim">Loading GPU data...</span></div>
+        </div>
+
+        <!-- Agent / Ollama / MCP health (the free space below GPU STATUS) -->
+        <div class="panel" style="margin-bottom:12px">
+          <div class="panel-title"><span class="icon">❤</span> SERVICE HEALTH
+            <span class="badge badge-dim" id="health-ts" style="margin-left:auto;font-size:0.6rem">--</span>
+            <button class="btn btn-sm" style="padding:2px 8px;font-size:0.6rem;margin-left:6px" onclick="refreshServiceHealth()">↻</button>
+          </div>
+          <div id="health-services"><span class="color-dim" style="font-family:'Share Tech Mono';font-size:0.72rem">Checking agent · ollama · mcp ...</span></div>
+        </div>
+
+        <!-- Top Processes -->
         <div class="panel">
           <div class="panel-title"><span class="icon">◈</span> TOP PROCESSES <span style="margin-left:auto" class="badge badge-dim" id="proc-count">-- procs</span></div>
           <table class="data-table">
@@ -1645,99 +2408,25 @@ header::after {
           </table>
         </div>
       </div>
+
       <div>
-        <!-- GPU Status (util · VRAM · temp) -->
+        <!-- Service quick-status -->
         <div class="panel" style="margin-bottom:12px">
-          <div class="panel-title"><span class="icon">⚡</span> GPU STATUS</div>
-          <div id="gpu-detail"><span class="color-dim">Loading GPU data...</span></div>
+          <div class="panel-title"><span class="icon">⚙</span> SERVICE STATUS</div>
+          <div id="svc-quick"></div>
         </div>
-        <!-- Heat / Temperatures -->
+
+        <!-- Network + VPN quick -->
+        <div class="panel" style="margin-bottom:12px">
+          <div class="panel-title"><span class="icon">◉</span> NETWORK</div>
+          <div id="net-quick"></div>
+        </div>
+
+        <!-- Temps -->
         <div class="panel">
-          <div class="panel-title"><span class="icon">🌡</span> HEAT / TEMPERATURES</div>
+          <div class="panel-title"><span class="icon">🌡</span> TEMPERATURES</div>
           <div id="temps-panel"><span class="color-dim" style="font-family:'Share Tech Mono';font-size:0.7rem">No sensor data</span></div>
         </div>
-      </div>
-    </div>
-
-    <!-- ══ CRYPTO TRADING DASHBOARD ══════════════════════════════════ -->
-    <div class="panel" style="margin-bottom:12px;border:1px solid rgba(240,180,40,0.3)">
-      <div class="panel-title" style="border-bottom:1px solid rgba(240,180,40,0.2);padding-bottom:8px;margin-bottom:10px">
-        <span class="icon">💰</span> CRYPTO TRADING — LIVE
-        <span style="margin-left:auto;display:flex;gap:6px;align-items:center">
-          <span class="badge" id="crypto-mode-badge" style="padding:2px 8px">--</span>
-          <span class="badge" id="crypto-exchange-badge" style="padding:2px 8px">--</span>
-          <span id="crypto-bot-badge"></span>
-          <span id="crypto-ai-badge"></span>
-        </span>
-      </div>
-
-      <!-- Crypto KPIs -->
-      <div class="grid-4" style="margin-bottom:10px">
-        <div class="stat-card clipped" data-label="BALANCE" style="border-color:rgba(240,180,40,0.3)">
-          <div class="stat-val color-gold" id="crypto-balance" style="font-size:1.6rem">$--</div>
-          <div class="stat-sub">HWM: <span id="crypto-hwm">--</span> | DD: <span id="crypto-dd" class="color-green">0%</span></div>
-        </div>
-        <div class="stat-card clipped" data-label="P&L" style="border-color:rgba(0,255,136,0.3)">
-          <div class="stat-val" id="crypto-pnl" style="font-size:1.6rem">$0.00</div>
-          <div class="stat-sub">TRADES: <span id="crypto-trades">0</span> | WR: <span id="crypto-wr">0%</span></div>
-        </div>
-        <div class="stat-card clipped" data-label="POSITIONS" style="border-color:rgba(0,200,255,0.3)">
-          <div class="stat-val color-cyan" id="crypto-positions" style="font-size:1.6rem">0</div>
-          <div class="stat-sub">MAX: <span id="crypto-max-pos">--</span> | RISK: <span id="crypto-risk">--</span>%</div>
-        </div>
-        <div class="stat-card clipped" data-label="CONFIDENCE" style="border-color:rgba(0,200,255,0.3)">
-          <div class="stat-val color-cyan" id="crypto-conf" style="font-size:1.6rem">--</div>
-          <div class="stat-sub">TF: <span id="crypto-tf">--</span> | <span id="crypto-nsymbols">--</span> PAIRS</div>
-        </div>
-      </div>
-
-      <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
-        <!-- Left: Open Positions + Recent Trades -->
-        <div>
-          <div style="font-family:'Share Tech Mono';font-size:0.68rem;color:var(--gold);margin-bottom:6px;text-transform:uppercase;letter-spacing:1px">Open Positions</div>
-          <div id="crypto-open-positions" style="font-family:'Share Tech Mono';font-size:0.7rem;margin-bottom:12px;min-height:30px">
-            <span class="color-dim">No open positions</span>
-          </div>
-          <div style="font-family:'Share Tech Mono';font-size:0.68rem;color:var(--gold);margin-bottom:6px;text-transform:uppercase;letter-spacing:1px">Recent Trades</div>
-          <div id="crypto-recent-trades" style="font-family:'Share Tech Mono';font-size:0.68rem;max-height:120px;overflow-y:auto">
-            <span class="color-dim">No trades yet</span>
-          </div>
-        </div>
-        <!-- Right: Log Tail -->
-        <div>
-          <div style="font-family:'Share Tech Mono';font-size:0.68rem;color:var(--gold);margin-bottom:6px;text-transform:uppercase;letter-spacing:1px">Bot Log (live)</div>
-          <div id="crypto-log-terminal" style="font-family:'Share Tech Mono';font-size:0.62rem;background:rgba(0,0,0,0.4);border:1px solid var(--border);border-radius:4px;padding:6px 8px;max-height:180px;overflow-y:auto;line-height:1.5;white-space:pre-wrap;word-break:break-all">
-            <span class="color-dim">Loading log...</span>
-          </div>
-        </div>
-      </div>
-
-      <!-- Pipeline Controls -->
-      <div style="margin-top:10px;padding-top:8px;border-top:1px solid rgba(240,180,40,0.15);display:flex;gap:6px;align-items:center;flex-wrap:wrap">
-        <span style="font-family:'Share Tech Mono';font-size:0.68rem;color:var(--dim);margin-right:6px">PIPELINE:</span>
-        <button class="btn btn-green btn-sm" onclick="cryptoAction('start_all')">▶ START ALL</button>
-        <button class="btn btn-red btn-sm" onclick="cryptoAction('stop_all')">■ STOP ALL</button>
-        <span style="color:var(--border);margin:0 4px">|</span>
-        <button class="btn btn-sm" style="background:rgba(0,200,255,0.15);color:var(--cyan);border:1px solid rgba(0,200,255,0.3)" onclick="cryptoAction('start_ai')">▶ AI SRV</button>
-        <button class="btn btn-sm" style="background:rgba(0,200,255,0.15);color:var(--cyan);border:1px solid rgba(0,200,255,0.3)" onclick="cryptoAction('stop_ai')">■ AI SRV</button>
-        <button class="btn btn-sm" style="background:rgba(240,180,40,0.15);color:var(--gold);border:1px solid rgba(240,180,40,0.3)" onclick="cryptoAction('start_bot')">▶ BOT</button>
-        <button class="btn btn-sm" style="background:rgba(240,180,40,0.15);color:var(--gold);border:1px solid rgba(240,180,40,0.3)" onclick="cryptoAction('stop_bot')">■ BOT</button>
-        <button class="btn btn-sm" style="background:rgba(0,255,136,0.1);color:var(--green);border:1px solid rgba(0,255,136,0.3)" onclick="cryptoAction('fetch_data')">↻ FETCH DATA</button>
-        <span id="crypto-pipeline-msg" style="font-family:'Share Tech Mono';font-size:0.65rem;color:var(--dim);margin-left:8px"></span>
-      </div>
-    </div>
-
-    <!-- ══ SERVICES + NETWORK (moved below the monitor row) ══════════════ -->
-    <div class="grid-2">
-      <!-- Service quick-status -->
-      <div class="panel">
-        <div class="panel-title"><span class="icon">⚙</span> SERVICE STATUS</div>
-        <div id="svc-quick"></div>
-      </div>
-      <!-- Network + VPN quick -->
-      <div class="panel">
-        <div class="panel-title"><span class="icon">◉</span> NETWORK</div>
-        <div id="net-quick"></div>
       </div>
     </div>
   </div>
@@ -2008,6 +2697,20 @@ header::after {
         <div class="panel-title"><span class="icon">⚙</span> MANAGED SERVICES</div>
         <div id="svc-list">Loading...</div>
       </div>
+
+      <!-- Telegram Live Monitor (Production) -->
+      <div class="panel" style="border-color: rgba(255,180,0,0.3)">
+        <div class="panel-title">
+          <span class="icon">✈️</span> TELEGRAM LIVE MONITOR
+          <span id="tg-monitor-badge" class="badge badge-dim" style="margin-left:8px">LIVE</span>
+        </div>
+        <div id="tg-monitor" style="font-family:'Share Tech Mono';font-size:0.78rem;line-height:1.35">
+          Loading Telegram session state...
+        </div>
+        <div style="margin-top:6px;font-size:0.7rem;color:var(--dim)">
+          Updates every 8s from telegram_bot.py status file
+        </div>
+      </div>
       <div class="panel">
         <div class="panel-title"><span class="icon">◎</span> SERVICE LOG</div>
         <div id="svc-log" class="terminal">
@@ -2039,8 +2742,18 @@ header::after {
         <div class="panel" style="margin-bottom:12px">
           <div class="panel-title"><span class="icon">◈</span> AGENT STATUS</div>
           <div id="activity-agents">
-            <div class="iface-row"><span class="iface-name">Agent v2 (CLI)</span><span id="agent-v2-status" class="badge badge-dim">IDLE</span></div>
-            <div class="iface-row"><span class="iface-name">Telegram Bot</span><span id="tg-bot-status" class="badge badge-dim">IDLE</span></div>
+            <div class="iface-row">
+                <span class="iface-name">Agent v2 (CLI)</span>
+                <span id="agent-v2-status" class="badge badge-dim">IDLE</span>
+                <button onclick="controlAgent('agent_v2', 'start')" style="margin-left:8px;font-size:10px;padding:1px 6px;">▶</button>
+                <button onclick="controlAgent('agent_v2', 'stop')" style="font-size:10px;padding:1px 6px;">⏹</button>
+            </div>
+            <div class="iface-row">
+                <span class="iface-name">Telegram Bot</span>
+                <span id="tg-bot-status" class="badge badge-dim">IDLE</span>
+                <button onclick="controlAgent('telegram_bot', 'start')" style="margin-left:8px;font-size:10px;padding:1px 6px;">▶</button>
+                <button onclick="controlAgent('telegram_bot', 'stop')" style="font-size:10px;padding:1px 6px;">⏹</button>
+            </div>
             <div class="iface-row"><span class="iface-name">Ollama Backend</span><span id="ollama-activity-status" class="badge badge-dim">IDLE</span></div>
           </div>
         </div>
@@ -2062,6 +2775,22 @@ header::after {
             <div class="iface-row"><span class="iface-name">Errors</span><span id="stat-errors" class="color-red">0</span></div>
           </div>
         </div>
+      </div>
+    </div>
+
+    <!-- LOG TAIL PANEL -->
+    <div class="panel" style="margin-top:12px">
+      <div class="panel-title"><span class="icon">📄</span> SYSTEM LOG TAIL
+        <span style="margin-left:auto;display:flex;gap:8px;align-items:center">
+          <select id="log-file-select" style="font-family:'Share Tech Mono';font-size:0.6rem;background:rgba(0,0,0,0.4);border:1px solid var(--border);color:var(--dim);padding:2px 4px" onchange="refreshLogs()">
+            <option value="">-- all recent --</option>
+          </select>
+          <span class="badge badge-dim" id="log-line-count">0 lines</span>
+          <button class="btn btn-sm" style="padding:2px 8px;font-size:0.5rem" onclick="refreshLogs()">REFRESH</button>
+        </span>
+      </div>
+      <div id="log-terminal" class="terminal" style="height:220px;font-size:0.65rem;overflow-y:auto;white-space:pre-wrap;word-break:break-all">
+        <span style="color:var(--dim)">// fetching logs...</span>
       </div>
     </div>
   </div>
@@ -2237,6 +2966,63 @@ header::after {
 <script>
 'use strict';
 
+// CSRF: attach the session token to every state-changing fetch (the dashboard
+// auth layer issues it as a SameSite cookie and verifies the header on POSTs).
+// === Dashboard Auth + CSRF Helpers (v4.0) =====================================
+(function(){
+  const _origFetch = window.fetch;
+
+  window.getCsrfToken = function() {
+    const m = document.cookie.match(/(?:^|; *)csrf_token=([^;]+)/);
+    return m ? decodeURIComponent(m[1]) : '';
+  };
+
+  // Global safe fetch helper — use this everywhere instead of raw fetch for APIs
+  window.dashboardFetch = async function(url, opts = {}) {
+    opts = opts || {};
+    const method = (opts.method || 'GET').toUpperCase();
+
+    if (method !== 'GET' && method !== 'HEAD') {
+      const token = window.getCsrfToken();
+      if (!token) {
+        // Token not present yet (just logged in) — try one more time after a tiny delay
+        await new Promise(r => setTimeout(r, 150));
+      }
+      opts.headers = Object.assign({}, opts.headers || {}, {
+        'X-CSRF-Token': window.getCsrfToken()
+      });
+    }
+
+    const res = await _origFetch(url, opts);
+
+    if (res.status === 401) {
+      const data = await res.json().catch(() => ({}));
+      const err = new Error(data.error || 'Session expired. Please log in again.');
+      err.status = 401;
+      throw err;
+    }
+    if (res.status === 403) {
+      const data = await res.json().catch(() => ({}));
+      const err = new Error(data.error || 'CSRF validation failed. Please refresh the page.');
+      err.status = 403;
+      throw err;
+    }
+
+    return res;
+  };
+
+  // Keep the old patched fetch for any legacy direct calls
+  window.fetch = function(url, opts) {
+    opts = opts || {};
+    const method = (opts.method || 'GET').toUpperCase();
+    if (method !== 'GET' && method !== 'HEAD') {
+      opts.headers = Object.assign({}, opts.headers, { 'X-CSRF-Token': window.getCsrfToken() });
+    }
+    return _origFetch(url, opts);
+  };
+})();
+// ==============================================================================
+
 // ── State ────────────────────────────────────────────────────────────
 const state = { health: {}, gpu: [], models: [], running: [], network: {}, services: {}, procs: [] };
 
@@ -2249,8 +3035,8 @@ function showTab(id) {
   if (id === 'models')   refreshModels();
   if (id === 'network')  refreshNetwork();
   if (id === 'security') { refreshListening(); secCenterInit(); }
-  if (id === 'services') refreshServices();
-  if (id === 'activity') refreshActivity();
+  if (id === 'services') { refreshServices(); refreshTelegramMonitor(); }
+  if (id === 'activity') { refreshActivity(); refreshAgentStatus(); }
   if (id === 'tools')    initToolsTab();
   if (id === 'db')       loadDB('');
 }
@@ -2359,25 +3145,16 @@ async function refreshHealth() {
       it8686:'Motherboard VRM', nct6775:'Fan Controller',
     };
     const temps = h.temperatures || {};
-    const tColor = v => (v > 80 ? 'color-red' : v > 65 ? 'color-orange' : 'color-green');
-    let tempRows = [];
-    // GPU temp comes from nvidia-smi (psutil exposes no temp sensors on Windows)
-    if (g.length > 0 && g[0].temp !== undefined && g[0].temp !== 'N/A') {
-      const gv = parseInt(g[0].temp);
-      tempRows.push(`<div class="iface-row"><span class="iface-name">GPU · ${g[0].name}</span><span class="${tColor(gv)}" style="font-family:'Orbitron';font-size:0.8rem">${gv}°C</span></div>`);
-    }
-    Object.keys(temps).forEach(k => {
-      const v = temps[k];
-      const label = TEMP_LABELS[k] || k;
-      tempRows.push(`<div class="iface-row"><span class="iface-name">${label}</span><span class="${tColor(v)}" style="font-family:'Orbitron';font-size:0.8rem">${v}°C</span></div>`);
-    });
-    const hasCpu = Object.keys(temps).some(k => (TEMP_LABELS[k] || '').includes('CPU'));
-    if (!hasCpu) {
-      tempRows.push('<div class="iface-row"><span class="iface-name color-dim">CPU die</span><span class="color-dim" style="font-family:\'Share Tech Mono\';font-size:0.6rem">install HWiNFO/LHM to read</span></div>');
-    }
-    document.getElementById('temps-panel').innerHTML = tempRows.length
-      ? tempRows.join('')
-      : '<span style="font-family:\'Share Tech Mono\';font-size:0.7rem;color:var(--dim)">No sensor data</span>';
+    const tKeys = Object.keys(temps);
+    let tempHtml = tKeys.length === 0
+      ? '<span style="font-family:\'Share Tech Mono\';font-size:0.7rem;color:var(--dim)">No sensor data</span>'
+      : tKeys.map(k => {
+          const v = temps[k];
+          const label = TEMP_LABELS[k] || k;
+          const cls = v > 80 ? 'color-red' : v > 65 ? 'color-orange' : 'color-green';
+          return `<div class="iface-row"><span class="iface-name">${label}</span><span class="${cls}" style="font-family:'Orbitron';font-size:0.8rem">${v}°C</span></div>`;
+        }).join('');
+    document.getElementById('temps-panel').innerHTML = tempHtml;
 
     // Processes table with KILL button
     let procHtml = '';
@@ -2422,8 +3199,29 @@ async function refreshModels() {
     } else if ([...sel.options].some(o => o.value === 'dolphin-mistral:latest')) {
       sel.value = 'dolphin-mistral:latest';
     }
-    // Persist choice
-    sel.onchange = () => localStorage.setItem('larry_chat_model', sel.value);
+    // Persist choice + auto-unload previous model from VRAM when switching in chat
+    window._lastChatModel = window._lastChatModel || sel.value;
+
+    sel.onchange = async () => {
+        const newModel = sel.value;
+        const oldModel = window._lastChatModel;
+
+        localStorage.setItem('larry_chat_model', newModel);
+
+        if (oldModel && oldModel !== newModel) {
+            console.log(`[Chat] Switching model: unloading ${oldModel}`);
+            try {
+                await fetch('/api/ollama/unload', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ model: oldModel })
+                });
+            } catch (e) {
+                console.warn('Unload on model switch failed:', e);
+            }
+        }
+        window._lastChatModel = newModel;
+    };
 
     // Model list with UNLOAD button for running models
     let html = '';
@@ -2605,6 +3403,38 @@ async function refreshServicesQuick() {
   } catch(e) {}
 }
 
+async function refreshTelegramMonitor() {
+  try {
+    const d = await fetch('/api/telegram/status').then(r => r.json());
+    const container = document.getElementById('tg-monitor');
+    if (!container) return;
+
+    let html = '';
+    html += `<div>Active sessions: <span class="color-cyan">${d.active_sessions || 0}</span></div>`;
+    html += `<div>Heavy tasks running: <span class="color-gold">${(d.heavy_tasks || []).length}</span></div>`;
+
+    if (d.long_prompt_builders && Object.keys(d.long_prompt_builders).length > 0) {
+      html += `<div style="margin-top:4px"><b>Long Prompt Builders:</b></div>`;
+      for (const [cid, info] of Object.entries(d.long_prompt_builders)) {
+        html += `<div style="padding-left:8px">• Chat ${cid}: ${info.parts} parts (since ${info.started ? info.started.substring(11,19) : '?'})</div>`;
+      }
+    }
+
+    if (d.heavy_task_details && Object.keys(d.heavy_task_details).length > 0) {
+      html += `<div style="margin-top:4px"><b>Active Heavy Work:</b></div>`;
+      for (const [cid, task] of Object.entries(d.heavy_task_details)) {
+        const short = (task || '').substring(0, 70);
+        html += `<div style="padding-left:8px">• ${cid}: ${short}...</div>`;
+      }
+    }
+
+    container.innerHTML = html || '<span style="color:var(--dim)">No active Telegram sessions right now.</span>';
+  } catch (e) {
+    const el = document.getElementById('tg-monitor');
+    if (el) el.innerHTML = '<span style="color:#f66">Failed to load Telegram status</span>';
+  }
+}
+
 async function startSvc(id) {
   svcLog(`Starting ${id}...`, 't-gold');
   try {
@@ -2735,18 +3565,36 @@ async function sendChat() {
   box.scrollTop = box.scrollHeight;
 
   try {
-    const d = await fetch('/api/ollama/chat', {
-      method: 'POST', headers: {'Content-Type':'application/json'},
+    const resp = await fetch('/api/ollama/chat', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({model, prompt})
-    }).then(r => r.json());
+    });
+
+    let data;
+    try {
+      data = await resp.json();
+    } catch (jsonErr) {
+      data = { error: 'Server returned invalid response (status ' + resp.status + ')' };
+    }
 
     document.getElementById('chat-thinking')?.remove();
-    const resp = d.response || d.error || 'No response';
-    addMsg('larry', resp);
-    chatMessages.push({role:'larry', text:resp});
-  } catch(e) {
+
+    if (!resp.ok) {
+      const msg = data.error || 'HTTP ' + resp.status;
+      addMsg('larry', '✗ Error: ' + msg);
+      return;
+    }
+
+    const reply = data.response || data.error || 'No response from model';
+    addMsg('larry', reply);
+    chatMessages.push({role: 'larry', text: reply});
+  } catch (e) {
     document.getElementById('chat-thinking')?.remove();
-    addMsg('larry', '✗ Error: ' + e);
+    // "Failed to fetch" usually means the server is unreachable or the request was blocked
+    const msg = (e && e.message) ? e.message : e;
+    addMsg('larry', '✗ Network Error: ' + msg + ' — try refreshing the page or check if the dashboard server is still running.');
+    console.error('Chat fetch failed:', e);
   }
 }
 
@@ -3016,7 +3864,7 @@ async function refreshActivity() {
       // Update agent status indicators
       if (ev.source === 'agent_v2') {
         const el = document.getElementById('agent-v2-status');
-        if (ev.type === 'generating') { el.className = 'badge badge-warn'; el.textContent = 'GENERATING'; }
+        if (ev.type === 'generating') { el.className = 'badge badge-warn'; el.textContent = 'GENERATING'; lastAgentActivity = Date.now(); }
         else if (ev.type === 'response_done') { el.className = 'badge badge-on'; el.textContent = 'READY'; }
         else if (ev.type === 'query_received') { el.className = 'badge badge-warn'; el.textContent = 'THINKING'; }
         else if (ev.type === 'system') { el.className = 'badge badge-on'; el.textContent = 'ONLINE'; }
@@ -3034,10 +3882,20 @@ async function refreshActivity() {
       const typeLabel = TYPE_LABEL[ev.type] || ev.type.toUpperCase();
       const line = document.createElement('div');
       line.className = 'ev';
+
+      let detailHtml = '';
+      if (ev.type === 'tool_dispatch' || ev.type === 'tool_call') {
+        detailHtml = `<span style="color:#f59e0b">→ ${ev.detail?.tool || ''}</span>`;
+      } else if (ev.type === 'execution') {
+        detailHtml = `<span style="color:#10b981">⚡ ${ev.detail?.command || ev.msg}</span>`;
+      } else if (ev.type === 'thinking') {
+        detailHtml = `<span style="color:#a78bfa">💭 ${ev.msg}</span>`;
+      }
+
       line.innerHTML = `<span class="ev-time">${ev.time || '--'}</span>`
         + `<span class="ev-src ${srcClass(ev.source)}">${srcLabel(ev.source)}</span>`
         + `<span class="ev-type ${typeCls}">[${typeLabel}]</span>`
-        + `<span>${ev.msg || ''}</span>`;
+        + `<span>${ev.msg || ''} ${detailHtml}</span>`;
       term.appendChild(line);
     });
 
@@ -3066,148 +3924,231 @@ function clearActivity() {
   activityStats = { queries: 0, gens: 0, rag: 0, tools: 0, errors: 0 };
 }
 
-// ── Crypto Trading Dashboard ──────────────────────────────────────────
-async function refreshCrypto() {
+// Poll agent status for Command Central panels (LAST MODEL, CONTEXT, etc.)
+async function refreshAgentStatus() {
   try {
-    const d = await fetch('/api/crypto/status').then(r => r.json());
-    const s = d.state || {};
-    const c = d.config || {};
-    const bot = d.bot || {};
-    const ai = d.ai_server || {};
-
-    // Mode & exchange badges
-    const modeEl = document.getElementById('crypto-mode-badge');
-    if (modeEl) {
-      const isLive = bot.live && !c.paper;
-      modeEl.textContent = isLive ? 'LIVE' : 'PAPER';
-      modeEl.style.background = isLive ? 'rgba(255,56,96,0.3)' : 'rgba(0,255,136,0.2)';
-      modeEl.style.color = isLive ? 'var(--red)' : 'var(--green)';
+    const res = await fetch('/api/agent/status').then(r => r.json());
+    if (res['agent_v2']) {
+      const s = res['agent_v2'];
+      const modelEl = document.getElementById('activity-last-model');
+      if (modelEl && s.model) modelEl.textContent = s.model;
+      const ctxEl = document.getElementById('activity-ctx-info');
+      if (ctxEl && s.context_tokens) ctxEl.textContent = `${s.context_tokens} tokens`;
     }
-    const exEl = document.getElementById('crypto-exchange-badge');
-    if (exEl) {
-      exEl.textContent = (c.exchange || '?').toUpperCase();
-      exEl.style.background = 'rgba(240,180,40,0.2)';
-      exEl.style.color = 'var(--gold)';
-    }
-
-    // Server badges
-    const botBadge = document.getElementById('crypto-bot-badge');
-    if (botBadge) botBadge.innerHTML = bot.running
-      ? `<span class="badge badge-on" style="padding:2px 6px">BOT ${bot.pid}</span>`
-      : '<span class="badge badge-off" style="padding:2px 6px">BOT OFF</span>';
-    const aiBadge = document.getElementById('crypto-ai-badge');
-    if (aiBadge) aiBadge.innerHTML = ai.running
-      ? `<span class="badge badge-on" style="padding:2px 6px">AI ${ai.healthy?'OK':'!'} ${ai.pid}</span>`
-      : '<span class="badge badge-off" style="padding:2px 6px">AI OFF</span>';
-
-    // KPIs — extract balance from log status line
-    const logLines = d.log || [];
-    let liveBalance = s.start_of_day_balance || 0;
-    for (let i = logLines.length - 1; i >= 0; i--) {
-      const m = logLines[i].match(/Status:\s*\$([0-9.]+)/);
-      if (m) { liveBalance = parseFloat(m[1]); break; }
-    }
-    const hwm = s.equity_hwm || liveBalance;
-    const dd = hwm > 0 ? ((hwm - liveBalance) / hwm * 100) : 0;
-
-    setText('crypto-balance', '$' + liveBalance.toFixed(2));
-    setText('crypto-hwm', '$' + hwm.toFixed(2));
-    const ddEl = document.getElementById('crypto-dd');
-    if (ddEl) {
-      ddEl.textContent = dd.toFixed(1) + '%';
-      ddEl.style.color = dd > 1 ? 'var(--red)' : 'var(--green)';
-    }
-
-    // P&L
-    const pnlEl = document.getElementById('crypto-pnl');
-    if (pnlEl) {
-      const pnl = s.total_pnl || 0;
-      pnlEl.textContent = (pnl >= 0 ? '+' : '') + '$' + pnl.toFixed(2);
-      pnlEl.style.color = pnl >= 0 ? 'var(--green)' : 'var(--red)';
-    }
-    setText('crypto-trades', s.n_trades || 0);
-    setText('crypto-wr', (s.win_rate || 0) + '%');
-
-    // Positions
-    setText('crypto-positions', s.n_open || 0);
-    setText('crypto-max-pos', c.max_positions || '--');
-    setText('crypto-risk', c.risk_per_trade || '--');
-    setText('crypto-conf', (c.min_confidence * 100 || 0).toFixed(0) + '%');
-    setText('crypto-tf', c.primary_tf || '--');
-    setText('crypto-nsymbols', c.n_symbols || '--');
-
-    // Open positions
-    const posEl = document.getElementById('crypto-open-positions');
-    if (posEl) {
-      const pos = s.open_positions || {};
-      const keys = Object.keys(pos);
-      if (keys.length === 0) {
-        posEl.innerHTML = '<span class="color-dim">No open positions</span>';
-      } else {
-        posEl.innerHTML = keys.map(k => {
-          const p = pos[k];
-          const side = (p.side || 'buy').toUpperCase();
-          const sideColor = side === 'BUY' ? 'var(--green)' : 'var(--red)';
-          return `<div style="margin-bottom:3px"><span style="color:${sideColor}">${side}</span> <span class="color-cyan">${k}</span> @ ${(p.entry_price||0).toFixed(4)} <span class="color-dim">qty:${(p.amount||0).toFixed(6)}</span></div>`;
-        }).join('');
+    if (res['telegram_bot']) {
+      const s = res['telegram_bot'];
+      const modelEl = document.getElementById('activity-last-model');
+      if (modelEl && s.model && !document.getElementById('activity-last-model').textContent.includes('agent')) {
+        // prefer agent_v2 if both reporting
       }
     }
-
-    // Recent trades
-    const tradesEl = document.getElementById('crypto-recent-trades');
-    if (tradesEl) {
-      const trades = (s.recent_trades || []).slice().reverse();
-      if (trades.length === 0) {
-        tradesEl.innerHTML = '<span class="color-dim">No trades yet</span>';
-      } else {
-        tradesEl.innerHTML = trades.map(t => {
-          const pnlColor = (t.pnl||0) >= 0 ? 'var(--green)' : 'var(--red)';
-          const pnlStr = (t.pnl||0) >= 0 ? '+' : '';
-          const timeStr = t.time ? t.time.substring(5, 16).replace('T',' ') : '';
-          return `<div style="margin-bottom:2px"><span class="color-dim">${timeStr}</span> <span class="color-cyan">${t.symbol||'?'}</span> <span style="color:${pnlColor}">${pnlStr}$${(t.pnl||0).toFixed(2)}</span> <span class="color-dim">${t.reason||''}</span></div>`;
-        }).join('');
-      }
-    }
-
-    // Log tail
-    const logEl = document.getElementById('crypto-log-terminal');
-    if (logEl) {
-      const wasAtBottom = logEl.scrollTop + logEl.clientHeight >= logEl.scrollHeight - 20;
-      if (logLines.length === 0) {
-        logEl.innerHTML = '<span class="color-dim">No log data</span>';
-      } else {
-        logEl.innerHTML = logLines.slice(-25).map(line => {
-          let cls = 'color-dim';
-          if (line.includes('ERROR') || line.includes('REJECTED')) cls = 't-err';
-          else if (line.includes('BUY') || line.includes('SELL') || line.includes('ORDER')) cls = 'color-gold';
-          else if (line.includes('LIVE') || line.includes('Status:')) cls = 'color-cyan';
-          else if (line.includes('WARNING') || line.includes('paused')) cls = 't-warn';
-          else if (line.includes('INFO')) cls = 'color-dim';
-          // Strip long timestamp prefix for readability
-          const shortLine = line.replace(/^\d{4}-\d{2}-\d{2}\s/, '');
-          return `<div class="${cls}">${shortLine}</div>`;
-        }).join('');
-      }
-      if (wasAtBottom) logEl.scrollTop = logEl.scrollHeight;
-    }
-  } catch(e) { console.warn('crypto fetch', e); }
+  } catch(e) { /* silent */ }
 }
 
-async function cryptoAction(action) {
-  const msgEl = document.getElementById('crypto-pipeline-msg');
-  if (msgEl) msgEl.innerHTML = `<span class="color-gold">⠋ ${action}...</span>`;
+async function controlAgent(name, action) {
+  const res = await fetch('/api/agent/control', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({ name, action })
+  }).then(r => r.json());
+
+  if (!res.success) {
+    alert("Failed: " + (res.error || "Unknown error"));
+  } else {
+    setTimeout(refreshAgentStatus, 800);
+  }
+}
+
+// ── FXJEFE Trading (MT5) ──────────────────────────────────────────────
+async function refreshMT5() {
   try {
-    const d = await fetch(`/api/crypto/pipeline/${action}`, {method:'POST'}).then(r=>r.json());
+    const d = await fetch('/api/mt5/status').then(r => r.json());
+    const conn = document.getElementById('mt5-conn-badge');
+    const acct = document.getElementById('mt5-account-badge');
+
+    if (!d.available || !d.connected) {
+      if (conn) {
+        conn.textContent = d.available ? 'DISCONNECTED' : 'WINDOWS ONLY';
+        conn.className = 'badge badge-off';
+      }
+      if (acct) acct.textContent = '--';
+      setText('mt5-updated', d.reason || 'MT5 not connected');
+      return;
+    }
+
+    if (conn) { conn.textContent = 'CONNECTED'; conn.className = 'badge badge-on'; }
+    if (acct) acct.textContent = '#' + d.login;
+
+    setText('mt5-equity', '$' + (d.equity || 0).toLocaleString());
+    setText('mt5-balance', '$' + (d.balance || 0).toLocaleString());
+    const pnlEl = document.getElementById('mt5-pnl');
+    if (pnlEl) {
+      const p = d.profit || 0;
+      pnlEl.textContent = (p >= 0 ? '+$' : '-$') + Math.abs(p).toLocaleString();
+      pnlEl.style.color = p >= 0 ? 'var(--green)' : 'var(--red)';
+    }
+    setText('mt5-margin', '$' + (d.margin || 0).toLocaleString());
+    setText('mt5-margin-free', '$' + (d.margin_free || 0).toLocaleString());
+    const mlEl = document.getElementById('mt5-margin-level');
+    if (mlEl) {
+      const ml = d.margin_level || 0;
+      mlEl.textContent = ml ? ml.toFixed(0) + '%' : '--';
+      mlEl.style.color = (ml && ml < 200) ? 'var(--red)' : 'var(--gold)';
+    }
+    setText('mt5-positions', d.n_positions || 0);
+    setText('mt5-leverage', '1:' + (d.leverage || '--'));
+    setText('mt5-server', d.server || '--');
+    setText('mt5-updated', 'Updated ' + (d.updated || '--') + '  ·  ' + (d.currency || ''));
+
+    const posEl = document.getElementById('mt5-open-positions');
+    if (posEl) {
+      const pos = d.positions || [];
+      if (pos.length === 0) {
+        posEl.innerHTML = '<span class="color-dim">No open positions</span>';
+      } else {
+        posEl.innerHTML = pos.map(p => {
+          const tc = p.type === 'BUY' ? 'var(--green)' : 'var(--red)';
+          const pc = p.profit >= 0 ? 'var(--green)' : 'var(--red)';
+          return `<div style="margin-bottom:3px;display:flex;align-items:center;gap:6px">`
+               + `<span style="color:${tc}">${p.type}</span>`
+               + `<span class="color-cyan">${p.symbol}</span> ${p.volume} @ ${p.open}`
+               + `<span class="color-dim">&rarr; ${p.current}</span>`
+               + `<span style="color:${pc}">${p.profit >= 0 ? '+' : ''}${p.profit}</span>`
+               + `<button class="btn btn-sm" style="margin-left:auto;padding:1px 6px;font-size:0.6rem;background:rgba(255,84,112,0.15);color:var(--red);border:1px solid rgba(255,84,112,0.3)" onclick="mt5Close(${p.ticket})">&times;</button>`
+               + `</div>`;
+        }).join('');
+      }
+    }
+  } catch(e) { console.warn('mt5 fetch', e); }
+}
+
+async function fxAction(endpoint, label) {
+  if (!confirm(label + ' — proceed?')) return;
+  const msgEl = document.getElementById('fx-control-msg');
+  if (msgEl) msgEl.innerHTML = `<span class="color-gold">⠩ ${label}...</span>`;
+  try {
+    const d = await fetch(`/api/fxjefe/${endpoint}`, {method:'POST'}).then(r=>r.json());
     if (msgEl) {
       const ok = d.success;
-      const msg = d.message || (d.results||[]).join(' | ') || d.error || '';
-      msgEl.innerHTML = `<span class="${ok?'color-green':'color-red'}">${ok?'✓':'✗'} ${msg}</span>`;
-      setTimeout(() => { if (msgEl) msgEl.innerHTML = ''; }, 8000);
+      msgEl.innerHTML = `<span class="${ok?'color-green':'color-red'}">${ok?'✓':'✗'} ${d.message||d.error||''}</span>`;
+      setTimeout(() => { if (msgEl) msgEl.innerHTML = ''; }, 9000);
     }
-    setTimeout(refreshCrypto, 2000);
   } catch(e) {
     if (msgEl) msgEl.innerHTML = `<span class="color-red">✗ ${e}</span>`;
   }
+}
+
+async function fxHealth() {
+  const out = document.getElementById('fx-health-out');
+  if (out) { out.textContent = 'Checking AI server health...'; out.style.color = 'var(--dim)'; }
+  try {
+    const d = await fetch('/api/fxjefe/health').then(r=>r.json());
+    if (!out) return;
+    if (d.ok) {
+      const h = d.health || {};
+      out.textContent = 'AI SERVER OK  ·  status=' + (h.status || '?')
+        + '  ·  models=' + (h.loaded_models !== undefined ? h.loaded_models : '?')
+        + '  ·  gate=' + (h.gate !== undefined ? h.gate : '?');
+      out.style.color = 'var(--green)';
+    } else {
+      out.textContent = '✗ ' + (d.error || 'AI server not reachable');
+      out.style.color = 'var(--red)';
+    }
+  } catch(e) {
+    if (out) { out.textContent = '✗ ' + e; out.style.color = 'var(--red)'; }
+  }
+}
+
+// ── MT5 manual trade ─────────────────────────────────────────────────
+function _trdMsg(text, color) {
+  const m = document.getElementById('trd-msg');
+  if (m) { m.textContent = text; m.style.color = 'var(--' + color + ')'; }
+}
+async function mt5Trade(side) {
+  const symbol = (document.getElementById('trd-sym').value || '').trim().toUpperCase();
+  const volume = parseFloat(document.getElementById('trd-vol').value);
+  const sl = parseFloat(document.getElementById('trd-sl').value) || null;
+  const tp = parseFloat(document.getElementById('trd-tp').value) || null;
+  if (!symbol || !volume) { _trdMsg('Need symbol and volume', 'red'); return; }
+  if (!confirm(`${side} ${volume} ${symbol}${sl ? ' SL ' + sl : ''}${tp ? ' TP ' + tp : ''} — proceed?`)) return;
+  _trdMsg(`⠩ sending ${side} ${symbol}...`, 'gold');
+  try {
+    const body = {symbol, side, volume, sl, tp};
+    const d = await fetch('/api/mt5/trade', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)}).then(r=>r.json());
+    _trdMsg((d.success ? '✓ ' : '✗ ') + (d.message || d.error || ''), d.success ? 'green' : 'red');
+  } catch(e) { _trdMsg('✗ ' + e, 'red'); }
+}
+async function mt5Close(ticket) {
+  if (!confirm('Close position ' + ticket + '?')) return;
+  _trdMsg('⠩ closing ' + ticket + '...', 'gold');
+  try {
+    const d = await fetch('/api/mt5/close', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ticket})}).then(r=>r.json());
+    _trdMsg((d.success ? '✓ ' : '✗ ') + (d.message || d.error || ''), d.success ? 'green' : 'red');
+  } catch(e) { _trdMsg('✗ ' + e, 'red'); }
+}
+async function mt5CloseAll() {
+  if (!confirm('Close ALL open positions — proceed?')) return;
+  _trdMsg('⠩ closing all...', 'gold');
+  try {
+    const d = await fetch('/api/mt5/close_all', {method:'POST'}).then(r=>r.json());
+    _trdMsg((d.success ? '✓ ' : '✗ ') + 'closed ' + (d.closed || 0) + '/' + (d.total || 0), d.success ? 'green' : 'red');
+  } catch(e) { _trdMsg('✗ ' + e, 'red'); }
+}
+
+// ── MCP Tools panel ─────────────────────────────────────────────────
+async function refreshMCP() {
+  const list = document.getElementById('mcp-list');
+  const badge = document.getElementById('mcp-summary-badge');
+  try {
+    const d = await fetch('/api/mcp/list').then(r => r.json());
+    if (!d.ok) {
+      if (list) list.innerHTML = '<span class="color-red">✗ ' + (d.error || 'MCP catalog unreachable') + '</span>';
+      if (badge) { badge.textContent = 'ERR'; badge.className = 'badge badge-off'; }
+      return;
+    }
+    if (badge) {
+      badge.textContent = d.enabled + '/' + d.count + ' ENABLED';
+      badge.className = d.enabled === d.count ? 'badge badge-on' : 'badge';
+    }
+    if (!list) return;
+    const depColor = {
+      'ready':         'var(--green)',
+      'needs-token':   'var(--gold)',
+      'missing-binary':'var(--red)',
+      'service-down':  'var(--gold)',
+      'unknown':       'var(--dim)',
+    };
+    const depLabel = {
+      'ready':         'READY',
+      'needs-token':   'NEEDS TOKEN',
+      'missing-binary':'MISSING BIN',
+      'service-down':  'SVC DOWN',
+      'unknown':       '?',
+    };
+    list.innerHTML = d.servers.map(s => {
+      const dc = depColor[s.dep_status] || 'var(--dim)';
+      const dl = depLabel[s.dep_status] || s.dep_status;
+      const onCls = s.enabled ? 'color-green' : 'color-dim';
+      const onTxt = s.enabled ? 'ON' : 'OFF';
+      const btnTxt = s.enabled ? 'disable' : 'enable';
+      return `<div style="display:flex;align-items:center;gap:8px;padding:3px 0;border-bottom:1px solid rgba(160,120,255,0.07)">
+        <span class="${onCls}" style="width:30px;font-weight:700">${onTxt}</span>
+        <span class="color-cyan" style="min-width:140px">${s.name}</span>
+        <span style="color:${dc};font-size:0.62rem;min-width:90px">${dl}</span>
+        <span class="color-dim" style="flex:1;font-size:0.62rem">${s.description || ''}</span>
+        <button class="btn btn-sm" style="padding:1px 8px;font-size:0.6rem;background:rgba(160,120,255,0.12);color:#c9b6ff;border:1px solid rgba(160,120,255,0.25)" onclick="mcpToggle('${s.name}',${!s.enabled})">${btnTxt}</button>
+      </div>`;
+    }).join('');
+  } catch(e) {
+    if (list) list.innerHTML = '<span class="color-red">✗ ' + e + '</span>';
+  }
+}
+async function mcpToggle(name, enabled) {
+  try {
+    const d = await fetch('/api/mcp/toggle', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({name, enabled})}).then(r => r.json());
+    if (!d.success) { alert('MCP toggle failed: ' + (d.error || '?')); }
+    refreshMCP();
+  } catch(e) { alert('MCP toggle error: ' + e); }
 }
 
 // ── Tools Tab ─────────────────────────────────────────────────────────
@@ -3648,21 +4589,107 @@ function quickDispatch(task) {
   agentDispatch();
 }
 
+// ── Log tail ─────────────────────────────────────────────────────────
+async function loadLogFiles() {
+  try {
+    const d = await fetch('/api/logs/files').then(r => r.json());
+    const sel = document.getElementById('log-file-select');
+    if (!sel) return;
+    while (sel.options.length > 1) sel.remove(1);
+    (d.files || []).forEach(f => {
+      const o = document.createElement('option'); o.value = f.name; o.textContent = f.name;
+      sel.appendChild(o);
+    });
+  } catch(e) {}
+}
+
+const LOG_COLORS = {
+  'ERROR': '#ff4444', 'WARNING': '#ffaa00', 'CRITICAL': '#ff0000',
+  'INFO': '#8888cc', 'DEBUG': '#555566',
+};
+
+async function refreshLogs() {
+  const sel = document.getElementById('log-file-select');
+  const file = sel ? sel.value : '';
+  const url = '/api/logs?lines=80' + (file ? '&file=' + encodeURIComponent(file) : '');
+  try {
+    const d = await fetch(url).then(r => r.json());
+    const term = document.getElementById('log-terminal');
+    if (!term) return;
+    const lines = d.lines || [];
+    document.getElementById('log-line-count').textContent = lines.length + ' lines';
+    if (!lines.length) { term.innerHTML = '<span style="color:var(--dim)">// no log lines found</span>'; return; }
+    term.innerHTML = lines.map(l => {
+      const fname = `<span style="color:var(--dim);font-size:0.58rem">[${l.file}]</span> `;
+      let color = 'var(--dim)';
+      for (const [kw, c] of Object.entries(LOG_COLORS)) { if (l.line.includes(kw)) { color = c; break; } }
+      const txt = l.line.replace(/&/g,'&amp;').replace(/</g,'&lt;');
+      return fname + `<span style="color:${color}">${txt}</span>`;
+    }).join('\n');
+    term.scrollTop = term.scrollHeight;
+  } catch(e) {}
+}
+
+// ── Agent / Ollama / MCP health panel (below GPU STATUS) ───────────────
+async function refreshServiceHealth() {
+  const el = document.getElementById('health-services');
+  if (!el) return;
+  const row = (label, ok, detail, warn) => {
+    const color = ok ? '#36e27b' : (warn ? '#ffb24d' : '#ff6b6b');
+    const glyph = ok ? '●' : (warn ? '◍' : '○');
+    return `<div style="display:flex;align-items:center;gap:8px;padding:5px 0;border-bottom:1px solid rgba(255,255,255,0.05)">
+        <span style="font-size:0.85rem;color:${color}">${glyph}</span>
+        <span style="min-width:92px;font-family:'Orbitron',sans-serif;font-size:0.68rem;color:#cbd3e0">${label}</span>
+        <span style="font-family:'Share Tech Mono';font-size:0.68rem;color:var(--dim)">${detail}</span>
+      </div>`;
+  };
+  try {
+    const d = await fetch('/api/health/services').then(r => r.json());
+    const a = d.agent || {}, o = d.ollama || {}, m = d.mcp || {};
+    const aPids = Object.entries(a.pids || {}).map(([k, v]) => `${k}:${v}`).join('  ');
+    const loaded = o.loaded || [];
+    let html = '';
+    html += row('🤖 AGENT', !!a.up, a.up ? (aPids || 'running') : 'stopped');
+    html += row('◎ OLLAMA', !!o.up,
+                o.up ? `${o.models} models · VRAM: ${loaded.length ? loaded.join(', ') : 'idle'}` : 'offline',
+                o.up && loaded.length === 0);
+    html += row('🔌 MCP', !!(m.ok && m.enabled > 0),
+                m.ok ? `${m.ready}/${m.enabled} ready · ${m.count} total` : (m.error || 'no mcp.json'),
+                m.ok && m.enabled > 0 && m.ready < m.enabled);
+    if (o.up && o.default_model) {
+      html += `<div style="font-family:'Share Tech Mono';font-size:0.62rem;color:var(--dim);padding-top:6px">default: ${o.default_model}</div>`;
+    }
+    el.innerHTML = html;
+    const ts = document.getElementById('health-ts');
+    if (ts) ts.textContent = d.ts || '';
+  } catch (e) {
+    el.innerHTML = '<span class="color-red" style="font-family:\'Share Tech Mono\';font-size:0.72rem">health check failed</span>';
+  }
+}
+
 // ── Init & polling ────────────────────────────────────────────────────
 async function init() {
-  await Promise.all([refreshHealth(), refreshModels(), refreshNetwork(), refreshCrypto()]);
+  await Promise.all([refreshHealth(), refreshServiceHealth(), refreshModels(), refreshNetwork(), refreshMT5(), refreshMCP()]);
+  await loadLogFiles();
+  await refreshLogs();
 }
 
 init();
-setInterval(refreshHealth, 5000);
-setInterval(refreshModels, 15000);
-setInterval(refreshNetwork, 20000);
-setInterval(refreshServicesQuick, 10000);
-setInterval(refreshActivity, 3000);
-setInterval(refreshCrypto, 5000);
+setInterval(refreshServiceHealth, 8000);
+setInterval(refreshHealth, 8000);
+setInterval(refreshModels, 20000);
+setInterval(refreshNetwork, 30000);
+setInterval(refreshServicesQuick, 15000);
+setInterval(refreshTelegramMonitor, 8000);
+setInterval(refreshActivity, 6000);
+setInterval(refreshAgentStatus, 4000);
+setInterval(refreshMT5, 6000);
+setInterval(refreshLogs, 15000);
+setInterval(refreshMCP, 60000);
 </script>
 </body>
 </html>"""
+
 
 @app.route("/")
 def dashboard():
@@ -3672,49 +4699,148 @@ def dashboard():
 # AUTOSTART ON LOGIN
 # ═══════════════════════════════════════════════════════════════════════
 
+
 def install_autostart():
-    """Create a .desktop entry for autostart on login (XDG autostart)."""
+    """Register the dashboard to start automatically at boot AND logon.
+    Creates a robust Scheduled Task that calls launch_dashboard.bat (preferred)
+    or falls back to direct python invocation. Works on the user's exact Python."""
+    if IS_WINDOWS:
+        _install_autostart_windows()
+    else:
+        _install_autostart_linux()
+
+
+def _install_autostart_windows():
+    """Windows: a Scheduled Task that launches the dashboard at log-on with
+    restart-on-failure. Falls back to a basic logon task if the XML is rejected."""
+    task_name = "FXJEFE-Dashboard"
+    pyw = Path(sys.executable).with_name("pythonw.exe")   # no console window
+    py = str(pyw) if pyw.exists() else sys.executable
+    script = str(Path(__file__).resolve())
+    xml = f'''<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo><Description>FXJEFE Command Central dashboard</Description></RegistrationInfo>
+  <Triggers><LogonTrigger><Enabled>true</Enabled></LogonTrigger></Triggers>
+  <Principals><Principal id="Author"><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <RestartOnFailure><Interval>PT1M</Interval><Count>3</Count></RestartOnFailure>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>{py}</Command>
+      <Arguments>"{script}" --no-browser</Arguments>
+      <WorkingDirectory>{PROJECT_ROOT}</WorkingDirectory>
+    </Exec>
+  </Actions>
+</Task>'''
+    tmp = PROJECT_ROOT / "_fxjefe_dashboard_task.xml"
+    try:
+        tmp.write_text(xml, encoding="utf-16")
+        subprocess.run(["schtasks", "/Create", "/TN", task_name, "/XML", str(tmp), "/F"],
+                       check=True, capture_output=True, text=True)
+        print(
+            f"Autostart registered: scheduled task '{task_name}' (logon + restartonfailure).")
+    except Exception:
+        # Fallback: a basic logon task without restart-on-failure.
+        try:
+            run = f'"{py}" "{script}" --no-browser'
+            subprocess.run(["schtasks", "/Create", "/TN", task_name, "/SC", "ONLOGON",
+                            "/TR", run, "/RL", "LIMITED", "/F"],
+                           check=True, capture_output=True, text=True)
+            print(
+                f"Autostart registered: scheduled task '{task_name}' (logon).")
+        except Exception as e2:
+            print(
+                f"Could not register the scheduled task: {e2}")
+            print("Run this shell as Administrator and retry. - dashboard_hub.py:4131")
+    finally:
+        try:
+            tmp.unlink()
+        except Exception:
+            pass
+
+
+def _install_autostart_linux():
+    """Linux: an XDG autostart .desktop entry (runs at desktop login)."""
     autostart_dir = Path.home() / ".config" / "autostart"
     autostart_dir.mkdir(parents=True, exist_ok=True)
-    script = PROJECT_ROOT / "start_dashboard.sh"
-    desktop = autostart_dir / "larry-dashboard.desktop"
+    desktop = autostart_dir / "fxjefe-dashboard.desktop"
     desktop.write_text(f"""[Desktop Entry]
 Type=Application
-Name=Larry G-FORCE Command Central
-Comment=Larry AI Dashboard Hub
-Exec=bash -c "cd {PROJECT_ROOT} && {sys.executable} {Path(__file__).resolve()} >> {PROJECT_ROOT}/logs/dashboard.log 2>&1"
+Name=FXJEFE Command Central
+Comment=FXJEFE / Larry Dashboard Hub
+Exec=bash -c "cd {PROJECT_ROOT} && {sys.executable} {Path(__file__).resolve()} --no-browser >> {PROJECT_ROOT}/logs/dashboard.log 2>&1"
 Terminal=false
 Hidden=false
 X-GNOME-Autostart-enabled=true
 """)
-    logger.info(f"Autostart installed: {desktop}")
+    logger.info(f"XDG autostart entry installed: {desktop}")
+    print(f"Autostart installed: {desktop}")
+
 
 def main():
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument("--install-autostart", action="store_true", help="Install XDG autostart entry")
+    parser.add_argument("--install-autostart", action="store_true",
+                        help="Register for ALL boots + logins (FXJEFE-Dashboard task via robust launcher + deps)")
+    parser.add_argument("--reset-password", action="store_true",
+                        help="Clear the dashboard password (next launch shows the setup page)")
     parser.add_argument("--port", type=int, default=DASHBOARD_PORT)
     parser.add_argument("--no-browser", action="store_true")
     args = parser.parse_args()
 
     if args.install_autostart:
         install_autostart()
-        print("✅ Autostart installed. Dashboard will open on next login.")
         return
 
+    if args.reset_password:
+        reset_password(DB_ROOT)
+        print("Dashboard password cleared - the setup page shows on next launch.")
+        return
+
+    # Local security: login + session + CSRF + Host-header allowlist.
+    init_auth(app, DB_ROOT, args.port)
+
+    # Force UTF-8 stdout/stderr so the banner (and any logged unicode) doesn't
+    # crash under a redirected console / cp1252 codepage / Scheduled Task.
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
+    # ASCII-only banner so it prints under any codepage even if reconfigure
+    # above is unavailable (pythonw, very old console hosts).
+    bar = "=" * 62
     print(f"""
-╔══════════════════════════════════════════════════════════════╗
-║   LARRY G-FORCE — COMMAND CENTRAL v3.0                       ║
-╠══════════════════════════════════════════════════════════════╣
-║   Dashboard : http://{HOST}:{args.port:<34} ║
-║   Press Ctrl+C to stop                                       ║
-╚══════════════════════════════════════════════════════════════╝
++{bar}+
+|   LARRY G-FORCE -- COMMAND CENTRAL v3.0                      |
++{bar}+
+|   Dashboard : http://{HOST}:{args.port:<34} |
+|   Press Ctrl+C to stop                                       |
++{bar}+
 """)
 
-    if not args.no_browser:
-        threading.Timer(1.2, lambda: webbrowser.open(f"http://{HOST}:{args.port}")).start()
+    auto_open = _CFG.get("dashboard", {}).get("auto_open_browser", True)
+    if not args.no_browser and auto_open:
+        def _open_browser(url: str) -> None:
+            browser_exe = _get_browser_path()
+            if browser_exe:
+                subprocess.Popen([browser_exe, "--new-window", url],
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            else:
+                webbrowser.open(url)
+
+        threading.Timer(1.2, lambda: _open_browser(
+            f"http://{HOST}:{args.port}")).start()
 
     app.run(host=HOST, port=args.port, debug=False, use_reloader=False)
+
 
 if __name__ == "__main__":
     main()
