@@ -17,8 +17,10 @@ Local Larry v2 — G-FORCE Enhanced Agent
 # Ensures that when running `python .../GITHUB/src/agent_v2.py` from anywhere,
 # all sibling modules (file_browser, kali_tools, etc.) are importable.
 # =============================================================================
-from activity_stream import ActivityStream
+from cli_style import banner as _cli_banner, style_response as _style_response, style_prompt as _style_prompt, info as _cli_info
+from activity_stream import ActivityStream, report_status
 from kali_tools import TOOLS, list_tools, tool_help, run_tool, parse_args_with_preset
+import security_tools_installer  # canonical installer (winget/choco/pip)
 from file_browser import FileBrowser, get_browser
 from model_router import ModelRouter, TaskType, list_models, get_router, MODEL_CONFIGS
 from memory_handoff import save_context_chunk, load_recent_handoffs, get_handoff_summary
@@ -75,6 +77,16 @@ if _GITHUB_ROOT.exists() and str(_GITHUB_ROOT) not in sys.path:
 _CONFIG_DIR = _GITHUB_ROOT / "config"
 if _CONFIG_DIR.exists() and str(_CONFIG_DIR) not in sys.path:
     sys.path.insert(0, str(_CONFIG_DIR))
+
+# 4. Extra safety: If we're running directly from inside a .../GITHUB folder,
+#    force the project root to be this directory (fixes wrong path resolution
+#    seen in some launch scenarios).
+_script_dir = Path(__file__).resolve().parent
+if _script_dir.name.lower() == "github" or (_script_dir / "agent_v2.py").exists():
+    # We're inside the canonical GITHUB folder
+    if str(_script_dir) not in sys.path:
+        sys.path.insert(0, str(_script_dir))
+    os.environ.setdefault("LARRY_HOME", str(_script_dir))
 # =============================================================================
 
 
@@ -258,6 +270,15 @@ except ImportError as _e:
     robin_chat = robin_get_scheduler = None
     AGENT_TOOLS_AVAILABLE = False
 
+# Session Manager + Terminal Handler (edge: persistent memory + safe local execution)
+# This gives the agent automatic context compression, previous-session recall, and safe /run /cd /py commands.
+try:
+    from session_manager import SessionManager, TerminalHandler
+    SESSION_MANAGER_AVAILABLE = True
+except ImportError:
+    SessionManager = TerminalHandler = None
+    SESSION_MANAGER_AVAILABLE = False
+
 # Portable path resolution — honors $LARRY_HOME and anchors to this file's location
 # so the project runs from any location (local install, USB stick, network share,
 # Linux, or Windows).
@@ -293,20 +314,70 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def _detect_gpu_layers() -> int:
+    """
+    Query VRAM and return a num_gpu layer count for Ollama partial offload.
+
+    Ollama's num_gpu is a layer count, not a boolean:
+      - 0   → CPU only
+      - N>0 → offload exactly N transformer layers to GPU, rest run on CPU RAM
+      - If the model has fewer than N layers, all layers go to GPU (safe to over-specify)
+
+    This design lets large models (30B+) use hybrid GPU+CPU inference:
+    GPU handles the first N layers for speed, CPU handles the overflow using
+    the 64 GB DDR5 pool.  -1 is NOT a valid Ollama value and must not be used.
+
+    VRAM thresholds (conservative — reserve ~1 GB for KV cache):
+      < 4 GB  →  10  layers  (minimal GPU assist)
+      4–9 GB  →  28  layers  (RTX 4060 8 GB: 30B partial offload works)
+      9–13 GB →  40  layers  (RTX 3080 / 4070)
+      13–18 GB→  60  layers  (RTX 3090 12 GB / 4080)
+      > 18 GB →  99  layers  (24 GB cards: most models fully on GPU)
+    """
+    try:
+        import subprocess as _sp
+        r = _sp.run(
+            ["nvidia-smi", "--query-gpu=memory.total",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=3,
+        )
+        if r.returncode == 0 and r.stdout.strip():
+            vram_mib = int(r.stdout.strip().splitlines()[0].strip())
+            vram_gb  = vram_mib / 1024
+            if vram_gb < 4:
+                return 10
+            elif vram_gb < 9:    # 8 GB cards — RTX 4060, 3050, 2080 etc.
+                return 28
+            elif vram_gb < 13:   # 10–12 GB cards
+                return 40
+            elif vram_gb < 18:   # 16 GB cards
+                return 60
+            else:                # 24 GB+ — RTX 3090, 4090
+                return 99
+    except Exception:
+        pass
+    return 0   # No GPU or nvidia-smi missing → full CPU
+
+
+_GPU_LAYERS = _detect_gpu_layers()
+
 # G-FORCE HARDWARE PROFILES
+# num_gpu is a layer count (see _detect_gpu_layers above).
+# SPEED / ACCURACY use partial offload so 30B+ models work via GPU+CPU split.
+# ULTRA_CONTEXT stays CPU-only: 131k KV cache alone exceeds 8 GB VRAM.
 HW_PROFILES = {
     "SPEED": {
-        "num_gpu": 0,         # CPU-only (VRAM free)
+        "num_gpu": _GPU_LAYERS,
         "num_ctx": 16384,
         "temperature": 0.7,
     },
     "ACCURACY": {
-        "num_gpu": 0,         # CPU-only (VRAM free)
+        "num_gpu": _GPU_LAYERS,
         "num_ctx": 65536,
         "temperature": 0.3,
     },
     "ULTRA_CONTEXT": {
-        "num_gpu": 0,         # CPU-only — 64GB DDR5 handles it
+        "num_gpu": 0,
         "num_ctx": 131072,
         "num_thread": 16,
     },
@@ -451,6 +522,11 @@ class EnhancedAgent:
         # Current model override (None = auto-route)
         self.forced_model: Optional[str] = None
 
+        # Respect cli_default_model from config as the base model for this CLI session
+        cli_default = LARRY_CONFIG.get("ollama", {}).get("cli_default_model")
+        if cli_default:
+            self.forced_model = cli_default
+
         # Skill Manager
         self.skill_manager = get_skill_manager() if SKILL_MANAGER_AVAILABLE else None
 
@@ -504,12 +580,44 @@ class EnhancedAgent:
             except Exception as e:
                 logger.warning(f"Sandbox Manager init failed: {e}")
 
+        # === EDGE: SessionManager + TerminalHandler (persistent memory + safe local execution) ===
+        self.session = None
+        self.terminal = None
+        if SESSION_MANAGER_AVAILABLE:
+            try:
+                self.session = SessionManager(
+                    rag=self.rag if hasattr(self, "rag") and self.rag else None,
+                    router=self.router if hasattr(self, "router") and self.router else None,
+                    user_id="default"
+                )
+                self.terminal = TerminalHandler(session=self.session)
+                logger.info("SessionManager + TerminalHandler initialized (edge mode: auto-compress + terminal)")
+            except Exception as e:
+                logger.warning(f"SessionManager integration failed: {e}")
+        else:
+            logger.info("SessionManager not available (edge features disabled)")
+        # === END EDGE ===
+
         # System prompt - FXJEFE Local Larry v2.7 Final (hot-reloadable)
         self.reload_system_prompt()  # Initial load + makes the method the single source of truth
 
         # Activity stream for dashboard
         self.activity = ActivityStream("agent_v2")
         self.activity.emit(ActivityStream.SYSTEM, "Agent v2 initialized")
+        report_status("agent_v2", status="ONLINE", model=self.forced_model)
+
+        # === EDGE: Startup banner for the new capabilities ===
+        if getattr(self, "session", None):
+            try:
+                self.activity.emit(ActivityStream.SYSTEM, "EDGE MODE: SessionManager + auto-compress + TerminalHandler active")
+                # Optional: one-line previous session reminder
+                last = self.session._load_last_summary() if hasattr(self.session, "_load_last_summary") else None
+                if last:
+                    goal = last.get("goal", "")[:60]
+                    self.activity.emit(ActivityStream.SYSTEM, f"Previous session memory loaded (goal: {goal})")
+            except Exception:
+                pass
+        # === END EDGE ===
 
         # FXJEFE Embeddings + Vector Store
         try:
@@ -552,6 +660,27 @@ class EnhancedAgent:
             "last_model": None
         }
 
+        # Subagent registry
+        self.subagents = {}
+        self.register_subagents()
+
+        # Speech integration
+        self.speech_enabled = VOICE_AVAILABLE
+
+        # Index codebase at startup if empty
+        self._index_at_startup()
+
+        # Robin tool-calling loop state (separate from RAG/chat history to avoid bleed)
+        self.tool_history: List[Dict[str, Any]] = []
+        self.tool_task_id: Optional[str] = None
+        if AGENT_TOOLS_AVAILABLE:
+            try:
+                robin_get_scheduler()  # eagerly start + rehydrate scheduled jobs
+            except Exception as e:
+                logger.warning(f"Robin scheduler init failed: {e}")
+
+        logger.info("EnhancedAgent initialized (G-FORCE)")
+
     def reload_system_prompt(self):
         """Hot-reload the system prompt from disk. Enforces the 're-read on every wake' rule in code.
 
@@ -575,6 +704,18 @@ class EnhancedAgent:
                 with open(prompt_path, "r", encoding="utf-8") as f:
                     self.system_prompt = f.read().strip()
                 logger.info(f"System prompt loaded from {prompt_path}")
+
+                # === EDGE: Inject previous session summary (memory handoff) ===
+                if getattr(self, "session", None):
+                    try:
+                        prev_ctx = self.session.get_context_injection()
+                        if prev_ctx:
+                            self.system_prompt = prev_ctx + "\n\n" + self.system_prompt
+                            logger.info("Previous session context prepended (edge memory)")
+                    except Exception as _ctx_err:
+                        logger.debug(f"Session context injection skipped: {_ctx_err}")
+                # === END EDGE ===
+
                 try:
                     self.activity.emit(ActivityStream.SYSTEM, "System prompt reloaded")
                 except Exception:
@@ -630,27 +771,6 @@ class EnhancedAgent:
                 logger.info(f"Memory + token handoff saved ({reason})")
         except Exception as e:
             logger.warning(f"Failed to save memory handoff: {e}")
-
-        # Subagent registry
-        self.subagents = {}
-        self.register_subagents()
-
-        # Speech integration
-        self.speech_enabled = VOICE_AVAILABLE
-
-        # Index codebase at startup if empty
-        self._index_at_startup()
-
-        # Robin tool-calling loop state (separate from RAG/chat history to avoid bleed)
-        self.tool_history: List[Dict[str, Any]] = []
-        self.tool_task_id: Optional[str] = None
-        if AGENT_TOOLS_AVAILABLE:
-            try:
-                robin_get_scheduler()  # eagerly start + rehydrate scheduled jobs
-            except Exception as e:
-                logger.warning(f"Robin scheduler init failed: {e}")
-
-        logger.info("EnhancedAgent initialized (G-FORCE)")
 
     def register_subagents(self):
         """Register subagents for specialized tasks."""
@@ -1028,6 +1148,75 @@ Answer concisely and technically, citing file names and line numbers when possib
 
         return f"Unknown web command: {cmd}"
 
+    # ── EDGE: Session + Terminal slash command handler ────────────────
+    def _handle_edge_commands(self, cmd: str, args: str) -> Optional[str]:
+        """
+        Real implementation for the new edge commands.
+        Gives you persistent memory + safe local shell execution inside the agent.
+        """
+        cmd = (cmd or "").lower().strip()
+        args = (args or "").strip()
+
+        # Session control
+        if cmd in ("new", "reset", "newsession"):
+            if not getattr(self, "session", None):
+                return "SessionManager not available."
+            try:
+                summary = self.session.end_session(save_to_rag=True)
+                return f"✅ Session saved to RAG + reset.\n\n{summary[:1400]}"
+            except Exception as e:
+                return f"Failed to end session: {e}"
+
+        if cmd == "session":
+            if not getattr(self, "session", None):
+                return "SessionManager not available."
+            try:
+                return self.session.format_status()
+            except Exception:
+                return str(self.session.get_status())
+
+        if cmd == "goal":
+            if not getattr(self, "session", None):
+                return "SessionManager not available."
+            if not args:
+                return "Usage: /goal <text for this session>"
+            self.session.set_goal(args)
+            return f"🎯 Goal set: {args}"
+
+        # Terminal / local execution (safe, restricted to allowed dirs)
+        if cmd in ("run", "shell", "exec"):
+            if not getattr(self, "terminal", None):
+                return "TerminalHandler not available."
+            if not args:
+                return "Usage: /run <shell command>"
+            result = self.terminal.execute(args)
+            try:
+                return self.terminal.format_result(result)
+            except Exception:
+                return f"stdout:\n{result.get('stdout','')}\nstderr:\n{result.get('stderr','')}"
+
+        if cmd == "cd":
+            if not getattr(self, "terminal", None):
+                return "TerminalHandler not available."
+            if not args:
+                return "Usage: /cd <path>"
+            ok, msg = self.terminal.set_cwd(args)
+            return msg
+
+        if cmd == "py":
+            if not getattr(self, "terminal", None):
+                return "TerminalHandler not available."
+            if not args:
+                return "Usage: /py <python_file.py> [args]"
+            result = self.terminal.run_python_file(args)
+            try:
+                return self.terminal.format_result(result)
+            except Exception:
+                return f"stdout:\n{result.get('stdout','')}\nstderr:\n{result.get('stderr','')}"
+
+        # Not one of our edge commands — let other handlers try
+        return None
+
     # ── Agentic mode ──────────────────────────────────────────────────
     def _get_tools_description(self) -> str:
         """JSON tool list for agentic mode."""
@@ -1186,6 +1375,15 @@ Answer concisely and technically, citing file names and line numbers when possib
         parts.append(f"\nUser: {query}\nAssistant:")
 
         full_prompt = "\n".join(parts)
+        if getattr(self, "router", None) is None or not hasattr(self.router, "route_query"):
+            try:
+                from model_router import get_router
+                self.router = get_router()
+            except Exception:
+                class _EmergencyRouter:
+                    def route_query(self, q): return ("llama3.2:3b", "chat", 8192)
+                    def generate(self, p, **k): return "[Emergency] Router broken."
+                self.router = _EmergencyRouter()
         model = self.forced_model or self.router.route_query(query)[0]
         options = hw_options or self._get_hw_options(query)
         response = self.router.generate(
@@ -1196,6 +1394,16 @@ Answer concisely and technically, citing file names and line numbers when possib
         """Get the appropriate model for this query."""
         if self.forced_model:
             return self.forced_model
+        if getattr(self, "router", None) is None or not hasattr(self.router, "route_query"):
+            try:
+                from model_router import get_router
+                self.router = get_router()
+            except Exception:
+                class _EmergencyRouter:
+                    def route_query(self, q): return ("llama3.2:3b", "chat", 8192)
+                    def detect_task(self, q): return "chat"
+                    def generate(self, p, **k): return "[Emergency] Router broken."
+                self.router = _EmergencyRouter()
         model, task, ctx = self.router.route_query(query)
         return model
 
@@ -1289,11 +1497,31 @@ Answer concisely and technically, citing file names and line numbers when possib
                                f"Bash script complete")
             return f"Bash script executed. Output shown above."
 
+        # === EDGE: SessionManager + TerminalHandler slash commands ===
+        # These give you /new, /session, /run, /cd, /goal, /py with real persistent memory + safe local execution.
+        if query.strip().startswith("/"):
+            cmd_line = query.strip()[1:].strip()
+            if cmd_line:
+                parts = cmd_line.split(maxsplit=1)
+                cmd = parts[0].lower()
+                args = parts[1] if len(parts) > 1 else ""
+                handled = self._handle_edge_commands(cmd, args)
+                if handled is not None:
+                    self.conversation.add("user", query)
+                    self.conversation.add("assistant", handled)
+                    try:
+                        self.activity.emit(ActivityStream.RESPONSE_DONE, f"Edge command: {cmd}")
+                    except Exception:
+                        pass
+                    return handled
+        # === END EDGE ===
+
         # Check if this is a natural-language security tool request
         tool_name, tool_args = self._try_tool_dispatch(query)
         if tool_name:
             self.activity.emit(ActivityStream.TOOL_DISPATCH,
                                f"Tool: {tool_name} {tool_args}")
+            self.activity.emit(ActivityStream.TOOL_CALL, f"Executing {tool_name}", {"tool": tool_name, "args": tool_args})
             tool_obj = TOOLS.get(tool_name)
             if not tool_obj:
                 return f"Tool '{tool_name}' not found."
@@ -1305,7 +1533,7 @@ Answer concisely and technically, citing file names and line numbers when possib
                     f"Timeout: {tool_obj.default_timeout}s  (Ctrl+C to abort)\n")
                 success, output = run_tool(tool_name, expanded)
                 status = "Done" if success else "Finished (non-zero exit)"
-                print(f"{output}\n\n[{status}]")
+                print(f"{output}\n\n[{status}] - agent_v2.py:1536")
 
                 # Persistence logging for tool usage
                 try:
@@ -1332,8 +1560,8 @@ Answer concisely and technically, citing file names and line numbers when possib
 
         self.activity.emit(ActivityStream.MODEL_SELECTED,
                            f"{model} -> {task.value}", {"model": model, "task": task.value})
-        print(f"🤖 Using model: {model}")
-        print(f"📋 Task type: {task.value}")
+        print(_cli_info("🤖 Using model: - agent_v2.py:1563", model))
+        print(f"📋 Task type: {task.value} - agent_v2.py:1564")
 
         # Build context
         context_parts = [self.system_prompt]
@@ -1408,6 +1636,16 @@ Answer concisely and technically, citing file names and line numbers when possib
 
         # Store response
         self.conversation.add("assistant", response)
+
+        # === EDGE: SessionManager turn tracking + auto-compression ===
+        if getattr(self, "session", None):
+            try:
+                self.session.add_turn(role="user", content=query)
+                self.session.add_turn(role="assistant", content=response)
+                self.session.maybe_summarize()
+            except Exception as _se:
+                logger.debug(f"Session turn tracking skipped: {_se}")
+        # === END EDGE ===
 
         # Track in context manager
         if self.context_mgr:
@@ -1711,9 +1949,9 @@ Answer concisely and technically, citing file names and line numbers when possib
                     diff_lines) if diff_lines else "(no diff)"
 
                 if not apply_now:
-                    print("\n" + "=" * 40 + " Diff " + "=" * 40)
+                    print("\n - agent_v2.py:1952" + "=" * 40 + " Diff " + "=" * 40)
                     print(diff_text)
-                    print("=" * 92 + "\n")
+                    print("= - agent_v2.py:1954" * 92 + "\n")
                     try:
                         ans = input("Apply changes? (y/N): ").strip().lower()
                     except EOFError:
@@ -1806,20 +2044,18 @@ async def main():
         })
         console = Console(theme=theme)
 
-    banner = """
-╔══════════════════════════════════════════════════════════════════════╗
-║  LARRY G-FORCE — Enhanced Multi-Model Local AI Agent v2            ║
-╠══════════════════════════════════════════════════════════════════════╣
-║  🤖 Multi-model routing   📁 File browsing & editing              ║
-║  🧠 Production RAG        💾 Persistent context                   ║
-║  🔒 100% Localhost         ⚡ Hardware profiles                    ║
-║  🛡️ Security tools         🎤 Voice I/O                           ║
-║  🧰 Sandbox safe-edit     🤖 Autonomous agentic mode              ║
-╚══════════════════════════════════════════════════════════════════════╝"""
-    print(banner)
-    print("\n  /help  full command list  |  /quit  exit")
-    print("/profile  hardware profile  |  /agent <task>  autonomous mode")
-    print("=" * 70)
+    print(_cli_banner(
+        "LARRY G-FORCE",
+        subtitle="🔥 created by FXJEFE  ·  Local Larry / Nikolai Warren Dreyer  ·  FXJEFE Algo AI & LarryLocal AI Agentic",
+        role="ASSISTANT",
+    ))
+    print(_cli_banner(
+        "Enhanced Multi-Model Local AI Agent v2",
+        subtitle="🤖 Multi-model routing  📁 File I/O  🧠 RAG  🔒 100% Localhost  🛡 Security  🤖 Agentic",
+        role="SYSTEM",
+    ))
+    print("\n  /help  full command list  |  /quit  exit - agent_v2.py:2057")
+    print("/profile  hardware profile  |  /agent <task>  autonomous mode - agent_v2.py:2058")
 
     agent = EnhancedAgent()
 
@@ -1834,7 +2070,7 @@ async def main():
 
     while True:
         try:
-            user_input = input("\n👤 You: ").strip()
+            user_input = input(_style_prompt("You")).strip()
 
             if not user_input:
                 continue
@@ -1869,7 +2105,7 @@ async def main():
                 args = parts[1:]
 
                 if cmd in ["quit", "exit", "q"]:
-                    print("👋 Goodbye!")
+                    print("👋 Goodbye! - agent_v2.py:2108")
                     break
 
                 elif cmd == "models":
@@ -1878,9 +2114,9 @@ async def main():
 
                 elif cmd == "reload-prompt":
                     if agent.reload_system_prompt():
-                        print("✅ System prompt reloaded from disk")
+                        print("✅ System prompt reloaded from disk - agent_v2.py:2117")
                     else:
-                        print("❌ Failed to reload system prompt")
+                        print("❌ Failed to reload system prompt - agent_v2.py:2119")
                     continue
 
                 elif cmd == "model":
@@ -1889,21 +2125,21 @@ async def main():
                         if model_name.lower() == "auto":
                             agent.forced_model = None
                             agent.reload_system_prompt()
-                            print("✅ Switched to auto model routing + prompt reloaded")
+                            print("✅ Switched to auto model routing + prompt reloaded - agent_v2.py:2128")
                         elif agent.router.set_model(model_name):
                             agent.forced_model = model_name
                             agent.reload_system_prompt()
-                            print(f"✅ Switched to model: {model_name} + prompt reloaded")
+                            print(f"✅ Switched to model: {model_name} + prompt reloaded - agent_v2.py:2132")
                         else:
-                            print(f"❌ Model not found: {model_name}")
-                            print("Use /models to see available models")
+                            print(f"❌ Model not found: {model_name} - agent_v2.py:2134")
+                            print("Use /models to see available models - agent_v2.py:2135")
                     else:
                         current = agent.forced_model or "auto (routing)"
-                        print(f"Current model: {current}")
+                        print(f"Current model: {current} - agent_v2.py:2138")
                     continue
 
                 elif cmd == "stats":
-                    print("\n📊 Statistics:")
+                    print("\n📊 Statistics: - agent_v2.py:2142")
                     print(
                         f"Available models: {len(agent.router.available_models)}")
                     print(
@@ -1941,7 +2177,7 @@ async def main():
                     if agent.voice_manager:
                         try:
                             voice_status = agent.voice_manager.get_status()
-                            print("Voice capabilities:")
+                            print("Voice capabilities: - agent_v2.py:2180")
                             print(
                                 f"STT: {voice_status.get('stt', voice_status.get('stt_model', 'Not available'))}")
                             print(
@@ -1955,11 +2191,11 @@ async def main():
                 elif cmd == "clear":
                     agent.save_memory_handoff("clear_command")
                     agent.conversation.clear()
-                    print("🧹 History cleared (handoff saved)")
+                    print("🧹 History cleared (handoff saved) - agent_v2.py:2194")
                     continue
 
                 elif cmd == "history":
-                    print("\n📝 Conversation History:")
+                    print("\n📝 Conversation History: - agent_v2.py:2198")
                     for i, msg in enumerate(agent.conversation.history[-10:]):
                         role = "👤" if msg["role"] == "user" else "🤖"
                         print(
@@ -1973,7 +2209,7 @@ async def main():
                             max_files = int(args[1]) if len(args) > 1 else 1000
                         except ValueError:
                             max_files = 1000
-                        print(f"📁 Indexing: {directory}")
+                        print(f"📁 Indexing: {directory} - agent_v2.py:2212")
                         if agent.rag:
                             result = agent.rag.index_directory(
                                 directory, max_files=max_files)
@@ -1989,7 +2225,7 @@ async def main():
                             print(
                                 f"✅ Indexed {result.get('indexed_count', 0)} files")
                         else:
-                            print("❌ RAG not available")
+                            print("❌ RAG not available - agent_v2.py:2228")
                     else:
                         print(
                             "❌ Usage: /index <directory> [max_files]")
@@ -2002,7 +2238,7 @@ async def main():
                             print(
                                 "❌ Only http:// and https:// URLs are allowed")
                             continue
-                        print(f"🌐 Fetching: {url}")
+                        print(f"🌐 Fetching: {url} - agent_v2.py:2241")
                         try:
                             import urllib.request
                             with urllib.request.urlopen(url, timeout=15) as resp:
@@ -2025,9 +2261,9 @@ async def main():
                                 print(
                                     f"✅ Fetched (RAG unavailable, not indexed): {url[:60]}")
                         except Exception as e:
-                            print(f"❌ Error: {e}")
+                            print(f"❌ Error: {e} - agent_v2.py:2264")
                     else:
-                        print("❌ Usage: /web <url>")
+                        print("❌ Usage: /web <url> - agent_v2.py:2266")
                     continue
 
                 elif cmd in ["ls", "cd", "pwd", "tree", "cat", "read", "type",
@@ -2057,16 +2293,18 @@ async def main():
                     print(list_tools())
                     print(
                         f"\n⚠️  '{' '.join(args)}' is not a known category or tool.")
-                    print("Categories: " + ", ".join(CATEGORIES.keys()))
+                    print("Categories: - agent_v2.py:2296" + ", ".join(CATEGORIES.keys()))
                     print(
                         "To run a specific tool: /kali <tool> [args]")
                     continue
 
                 elif cmd == "kali":
                     if not args:
-                        print("Usage: /kali <tool> [:<preset>] [args]\n"
-                              "       /kali list [category]\n"
-                              "       /kali help <tool>")
+                        print(
+                            "Usage: /kali <tool> [:<preset>] [args]\n"
+                            "       /kali list [category]\n"
+                            "       /kali help <tool>"
+                        )
                         continue
                     sub = args[0].lower()
                     if sub == "list":
@@ -2095,7 +2333,7 @@ async def main():
                         f"Timeout: {tool_obj.default_timeout}s  (Ctrl+C to abort)\n")
                     success, output = run_tool(tool_name, expanded)
                     status = "Done" if success else "Finished (non-zero exit)"
-                    print(f"{output}\n[{status}]")
+                    print(f"{output}\n[{status}] - agent_v2.py:2336")
                     agent.conversation.add(
                         "user", f"/kali {tool_name} {raw_args}")
                     agent.conversation.add(
@@ -2116,7 +2354,7 @@ async def main():
                         f"Timeout: {tool_obj.default_timeout}s  (Ctrl+C to abort)\n")
                     success, output = run_tool(cmd, expanded)
                     status = "Done" if success else "Finished (non-zero exit)"
-                    print(f"{output}\n[{status}]")
+                    print(f"{output}\n[{status}] - agent_v2.py:2357")
                     agent.conversation.add("user", f"/{cmd} {raw_args}")
                     agent.conversation.add(
                         "assistant", f"[Tool: {cmd} {raw_args}]\n{output}\n[{status}]")
@@ -2125,12 +2363,12 @@ async def main():
                 # ── FXJEFE Local MCP Tools (for testing tool use with Ollama) ──
                 elif cmd == "fxjefe":
                     if not (MCP_AVAILABLE and hasattr(agent.mcp, 'fxjefe') and agent.mcp.fxjefe and agent.mcp.fxjefe.available):
-                        print("FXJEFE Local MCP server not available. Run: python mcp/fxjefe-local-mcp/fxjefe_local_mcp_server.py")
+                        print("FXJEFE Local MCP server not available. Run: python mcp/fxjefelocalmcp/fxjefe_local_mcp_server.py - agent_v2.py:2366")
                         continue
                     if not args:
-                        print("Available FXJEFE tools:")
-                        print(", ".join(agent.mcp.fxjefe.get_tools()))
-                        print("\nUsage: /fxjefe <tool_name> [args as json or key=value]")
+                        print("Available FXJEFE tools: - agent_v2.py:2369")
+                        print(", - agent_v2.py:2370".join(agent.mcp.fxjefe.get_tools()))
+                        print("\nUsage: /fxjefe <tool_name> [args as json or key=value] - agent_v2.py:2371")
                         continue
                     tool_name = args[0]
                     # Very simple arg parsing for testing
@@ -2145,7 +2383,7 @@ async def main():
                                     k, v = a.split("=", 1)
                                     params[k] = v
                     result = agent.mcp.fxjefe.call(tool_name, **params)
-                    print(f"\n[FXJEFE:{tool_name}]\n{result}")
+                    print(f"\n[FXJEFE:{tool_name}]\n{result} - agent_v2.py:2386")
                     continue
 
                 # ── Security Command Center ───────────────────────────────
@@ -2168,7 +2406,7 @@ async def main():
 
                 elif cmd in ("investigate", "ports"):
                     if not SECURITY_AVAILABLE:
-                        print("\n⚠️ Security tools not available")
+                        print("\n⚠️ Security tools not available - agent_v2.py:2409")
                     else:
                         inv_args = " ".join(args) if args else ""
                         output = _security_center.handle_command(
@@ -2180,7 +2418,7 @@ async def main():
 
                 elif cmd == "hunt":
                     if not SECURITY_AVAILABLE:
-                        print("\n⚠️ Security tools not available")
+                        print("\n⚠️ Security tools not available - agent_v2.py:2421")
                     else:
                         hunt_args = " ".join(args) if args else ""
                         output = _security_center.handle_command(
@@ -2188,6 +2426,28 @@ async def main():
                         print(output)
                         agent.conversation.add("user", user_input)
                         agent.conversation.add("assistant", output)
+                    continue
+
+                # ── Security Tools Installer ──────────────────────────────
+                elif cmd in ("install-tools", "installtools", "security-setup"):
+                    print("🔧 Security Tools Installer (winget/choco) - agent_v2.py:2433")
+                    try:
+                        import security_tools_installer
+                        print(security_tools_installer.get_install_status_report())
+                        print(security_tools_installer.install_all_missing())
+                    except Exception as e:
+                        print(f"Installer error: {e} - agent_v2.py:2439")
+                    continue
+
+                elif cmd == "install":
+                    if not args:
+                        print("Usage: /install <tool> - agent_v2.py:2444")
+                        continue
+                    try:
+                        import security_tools_installer
+                        print(security_tools_installer.install_tool(args[0]))
+                    except Exception as e:
+                        print(f"Error: {e} - agent_v2.py:2450")
                     continue
 
                 # ── Bash Script Runner ────────────────────────────────────
@@ -2305,7 +2565,7 @@ async def main():
                 elif cmd == "profile":
                     if args:
                         result = agent.set_profile(args[0])
-                        print(f"{result}")
+                        print(f"{result} - agent_v2.py:2568")
                     else:
                         print(
                             f"\n{agent.get_profile_info()}")
@@ -2315,9 +2575,9 @@ async def main():
                     if agent.context_mgr:
                         try:
                             info = agent.context_mgr.get_stats()
-                            print(f"\n📊 Context: {info}")
+                            print(f"\n📊 Context: {info} - agent_v2.py:2578")
                         except Exception as e:
-                            print(f"Context info: {e}")
+                            print(f"Context info: {e} - agent_v2.py:2580")
                     else:
                         print(
                             f"History: {len(agent.conversation.history)} messages")
@@ -2329,7 +2589,7 @@ async def main():
                     text = " ".join(
                         args) if args else agent.conversation.get_context(n=20)
                     count = agent.count_tokens(text)
-                    print(f"Tokens: {count:,}")
+                    print(f"Tokens: {count:,} - agent_v2.py:2592")
                     continue
 
                 elif cmd in ("web", "scrape"):
@@ -2369,15 +2629,15 @@ async def main():
 
                 elif cmd == "voice":
                     if not VOICE_AVAILABLE or not agent.voice_manager:
-                        print("❌ Voice module not available")
+                        print("❌ Voice module not available - agent_v2.py:2632")
                         continue
                     try:
                         status = agent.voice_manager.get_status()
                     except Exception as e:
-                        print(f"❌ Voice status failed: {e}")
+                        print(f"❌ Voice status failed: {e} - agent_v2.py:2637")
                         continue
-                    print("\n🎤 Voice Module Status:")
-                    print("= * 40")
+                    print("\n🎤 Voice Module Status: - agent_v2.py:2639")
+                    print("= * 40 - agent_v2.py:2640")
                     print(
                         f"🗣️ STT: {'✅' if status.get('stt_available') else '❌'} {status.get('stt_model', 'N/A')}")
                     print(
@@ -2393,10 +2653,10 @@ async def main():
 
                 elif cmd == "speak":
                     if not VOICE_AVAILABLE or not agent.voice_manager:
-                        print("❌ Voice module not available")
+                        print("❌ Voice module not available - agent_v2.py:2656")
                         continue
                     if not args:
-                        print("❌ Usage: /speak <text to speak>")
+                        print("❌ Usage: /speak <text to speak> - agent_v2.py:2659")
                         continue
                     text = " ".join(args)
                     print(
@@ -2406,7 +2666,7 @@ async def main():
                         if audio_path:
                             print(
                                 f"✅ Voice generated: {audio_path}")
-                            print("🎵 Playing audio...")
+                            print("🎵 Playing audio... - agent_v2.py:2669")
                             try:
                                 if platform.system() == "Windows":
                                     os.startfile(audio_path)
@@ -2419,7 +2679,7 @@ async def main():
                                 print(
                                     f"⚠️ Could not autoplay: {e}")
                         else:
-                            print("✅ Speaking...")
+                            print("✅ Speaking... - agent_v2.py:2682")
                     except Exception as e:
                         print(
                             f"❌ Voice generation failed: {e}")
@@ -2427,20 +2687,20 @@ async def main():
 
                 elif cmd == "listen":
                     if not VOICE_AVAILABLE or not agent.voice_manager:
-                        print("❌ Voice module not available")
+                        print("❌ Voice module not available - agent_v2.py:2690")
                         continue
                     print(
                         "🎙️ Voice input mode  speak now (press Enter when done)")
                     print(
                         "Note: This requires a microphone and audio file input")
-                    print("For now, you can:")
-                    print("1. Record audio to a file (WAV/MP3/OGG)")
-                    print("2. Use: /transcribe <audio_file_path>")
+                    print("For now, you can: - agent_v2.py:2696")
+                    print("1. Record audio to a file (WAV/MP3/OGG) - agent_v2.py:2697")
+                    print("2. Use: /transcribe <audio_file_path> - agent_v2.py:2698")
                     continue
 
                 elif cmd == "transcribe":
                     if not VOICE_AVAILABLE or not agent.voice_manager:
-                        print("❌ Voice module not available")
+                        print("❌ Voice module not available - agent_v2.py:2703")
                         continue
                     if not args:
                         print(
@@ -2451,17 +2711,17 @@ async def main():
                         print(
                             f"❌ Audio file not found: {audio_path}")
                         continue
-                    print(f"🎤 Transcribing: {audio_path}")
+                    print(f"🎤 Transcribing: {audio_path} - agent_v2.py:2714")
                     try:
                         text = agent.voice_manager.transcribe(audio_path)
                         if text and text.strip():
-                            print(f"📝 Transcribed: {text}")
+                            print(f"📝 Transcribed: {text} - agent_v2.py:2718")
                             print(
                                 "\n🤖 Processing transcribed text...")
                             response = await agent.process_query(text)
-                            print(f"💬 Response: {response}")
+                            print(f"💬 Response: {response} - agent_v2.py:2722")
                         else:
-                            print("❌ Could not transcribe audio")
+                            print("❌ Could not transcribe audio - agent_v2.py:2724")
                     except Exception as e:
                         print(
                             f"❌ Transcription failed: {e}")
@@ -2493,14 +2753,14 @@ async def main():
 
                 elif cmd == "agent":
                     if not args:
-                        print("Usage: /agent <task description>")
+                        print("Usage: /agent <task description> - agent_v2.py:2756")
                     else:
                         task = " ".join(args)
                         print(
                             f"🤖 Starting autonomous agent for: {task}")
 
                         def _feedback(msg):
-                            print(f"{msg}")
+                            print(f"{msg} - agent_v2.py:2763")
                         result = await agent.process_query_agentic(task, feedback_cb=_feedback)
                         print(
                             f"\n🤖 Agent result:\n{result}")
@@ -2508,8 +2768,8 @@ async def main():
 
                 elif cmd == "mcp":
                     if MCP_AVAILABLE and agent.mcp:
-                        print("\n🔌 MCP Tools Status (FXJEFE Local Larry Distribution)")
-                        print("=" * 60)
+                        print("\n🔌 MCP Tools Status (FXJEFE Local Larry Distribution) - agent_v2.py:2771")
+                        print("= - agent_v2.py:2772" * 60)
                         try:
                             status = agent.mcp.get_status()
                         except Exception:
@@ -2518,11 +2778,11 @@ async def main():
                         # Highlight the excellent FXJEFE Local MCP server (the real working asset)
                         if hasattr(agent.mcp, 'fxjefe') and agent.mcp.fxjefe:
                             fx = agent.mcp.fxjefe
-                            print("★ FXJEFE Local Security & Productivity Suite")
-                            print(f"  Available: {fx.available}")
+                            print("★ FXJEFE Local Security & Productivity Suite - agent_v2.py:2781")
+                            print(f"Available: {fx.available} - agent_v2.py:2782")
                             if fx.available:
-                                print(f"  Tools: {', '.join(fx.get_tools())}")
-                                print("  Launch: python mcp/fxjefe-local-mcp/fxjefe_local_mcp_server.py")
+                                print(f"Tools: {', '.join(fx.get_tools())} - agent_v2.py:2784")
+                                print("Launch: python mcp/fxjefelocalmcp/fxjefe_local_mcp_server.py - agent_v2.py:2785")
                             print()
 
                         # Other MCP categories
@@ -2530,15 +2790,15 @@ async def main():
                             loaded = sorted(agent.mcp.client.servers.keys())
                         except Exception:
                             loaded = []
-                        print(f" In-process servers loaded: {len(loaded)}")
+                        print(f"Inprocess servers loaded: {len(loaded)} - agent_v2.py:2793")
                         if loaded:
-                            print(f"   {', '.join(loaded)}")
+                            print(f"{', '.join(loaded)} - agent_v2.py:2795")
                         print()
 
                         # Quick test call for FXJEFE tools (for verification)
                         # Usage: /mcp fxjefe static_security_scan /path/to/file.py
                         if hasattr(agent.mcp, 'fxjefe') and agent.mcp.fxjefe and agent.mcp.fxjefe.available:
-                            print("FXJEFE tools ready for testing. Example: /fxjefe static_security_scan <file>")
+                            print("FXJEFE tools ready for testing. Example: /fxjefe static_security_scan <file> - agent_v2.py:2801")
 
                         # Known tool-wrapper categories with per-feature status
                         for key, label, note in [
@@ -2577,7 +2837,7 @@ async def main():
 
                 elif cmd in ("rag", "ask"):
                     if not args:
-                        print("❌ Usage: /rag <question>")
+                        print("❌ Usage: /rag <question> - agent_v2.py:2840")
                     else:
                         rag_query = " ".join(args)
                         print(agent.ask_about_code(rag_query))
@@ -2585,7 +2845,7 @@ async def main():
 
                 elif cmd == "summarize":
                     if CONTEXT_MANAGER_AVAILABLE and agent.context_mgr:
-                        print("📝 Forcing context summarization...")
+                        print("📝 Forcing context summarization... - agent_v2.py:2848")
                         try:
                             summary = agent.context_mgr.force_summarize()
                             if summary:
@@ -2604,7 +2864,7 @@ async def main():
                             print(
                                 f"❌ Summarization failed: {e}")
                     else:
-                        print("❌ Context manager not available")
+                        print("❌ Context manager not available - agent_v2.py:2867")
                     continue
 
                 elif cmd == "sessions":
@@ -2622,7 +2882,7 @@ async def main():
                                 sessions = agent.context_mgr.list_sessions()
                                 current = getattr(
                                     agent.context_mgr, 'current_session', None)
-                                print("\n📋 Sessions:")
+                                print("\n📋 Sessions: - agent_v2.py:2885")
                                 for sess in sessions:
                                     sid = sess.get("id", "?")
                                     marker = "→" if sid == current else " "
@@ -2634,12 +2894,12 @@ async def main():
                                 print(
                                     f"❌ Could not list sessions: {e}")
                     else:
-                        print("❌ Context manager not available")
+                        print("❌ Context manager not available - agent_v2.py:2897")
                     continue
 
                 elif cmd == "tasks":
                     if CONTEXT_MANAGER_AVAILABLE and agent.task_mgr:
-                        print("\n📋 Task → Model Mappings:")
+                        print("\n📋 Task → Model Mappings: - agent_v2.py:2902")
                         try:
                             for task, model in agent.task_mgr.task_models.items():
                                 print(
@@ -2650,17 +2910,17 @@ async def main():
                             print(
                                 f"❌ Could not read task mappings: {e}")
                     else:
-                        print("❌ Task manager not available")
+                        print("❌ Task manager not available - agent_v2.py:2913")
                     continue
 
                 elif cmd == "scrape":
                     if not args:
-                        print("❌ Usage: /scrape <url>")
+                        print("❌ Usage: /scrape <url> - agent_v2.py:2918")
                     elif not WEB_TOOLS_AVAILABLE or not agent.web_scraper:
-                        print("❌ Web scraper not available")
+                        print("❌ Web scraper not available - agent_v2.py:2920")
                     else:
                         url = args[0]
-                        print(f"🌐 Scraping: {url}")
+                        print(f"🌐 Scraping: {url} - agent_v2.py:2923")
                         try:
                             if hasattr(agent.web_scraper, 'scrape_and_save'):
                                 filepath, success = agent.web_scraper.scrape_and_save(
@@ -2688,18 +2948,18 @@ async def main():
                                 print(
                                     f"❌ Error: {filepath}")
                         except Exception as e:
-                            print(f"❌ Error: {e}")
+                            print(f"❌ Error: {e} - agent_v2.py:2951")
                     continue
 
                 elif cmd in ("youtube", "yt"):
                     if not args:
-                        print("❌ Usage: /youtube <url>")
+                        print("❌ Usage: /youtube <url> - agent_v2.py:2956")
                         continue
                     if not WEB_TOOLS_AVAILABLE:
-                        print("❌ YouTube tools not available")
+                        print("❌ YouTube tools not available - agent_v2.py:2959")
                         continue
                     url = args[0]
-                    print(f"📺 Processing YouTube: {url}")
+                    print(f"📺 Processing YouTube: {url} - agent_v2.py:2962")
                     try:
                         # Re-initialize the summarizer to clear old cache
                         from web_tools import YouTubeSummarizer
@@ -2725,17 +2985,17 @@ async def main():
                             except Exception:
                                 pass
                         else:
-                            print("❌ Could not generate summary.")
+                            print("❌ Could not generate summary. - agent_v2.py:2988")
                     except Exception as e:
-                        print(f"❌ YouTube Error: {e}")
+                        print(f"❌ YouTube Error: {e} - agent_v2.py:2990")
                     continue
 
                 elif cmd == "memory":
                     if not MCP_AVAILABLE or not agent.mcp or not getattr(agent.mcp, 'memory', None) or not getattr(agent.mcp.memory, 'available', False):
-                        print("❌ Memory server not available")
+                        print("❌ Memory server not available - agent_v2.py:2995")
                         continue
                     if not args:
-                        print("\n🧠 Memory Commands:")
+                        print("\n🧠 Memory Commands: - agent_v2.py:2998")
                         print(
                             "/memory show                Show knowledge graph stats")
                         print(
@@ -2750,13 +3010,13 @@ async def main():
                     try:
                         if subcmd == "show":
                             graph = agent.mcp.memory.read_graph()
-                            print(f"\n🧠 Knowledge Graph:")
+                            print(f"\n🧠 Knowledge Graph: - agent_v2.py:3013")
                             print(
                                 f"Entities: {graph.get('entity_count', 0)}")
                             print(
                                 f"Relations: {graph.get('relation_count', 0)}")
                             if graph.get("entities"):
-                                print("\n  Entities:")
+                                print("\n  Entities: - agent_v2.py:3019")
                                 for e in graph["entities"][:10]:
                                     print(
                                         f"• {e['name']} [{e['entity_type']}]  {len(e.get('observations', []))} observations")
@@ -2769,7 +3029,7 @@ async def main():
                                 print(
                                     f"• {e['name']} [{e['entity_type']}]")
                                 for obs in e.get("observations", [])[:2]:
-                                    print(f"{obs[:80]}...")
+                                    print(f"{obs[:80]}... - agent_v2.py:3032")
                         elif subcmd == "add" and len(subargs) >= 2:
                             name = subargs[0]
                             entity_type = subargs[1]
@@ -2797,10 +3057,10 @@ async def main():
 
                 elif cmd in ("github", "gh"):
                     if not MCP_AVAILABLE or not agent.mcp or not getattr(agent.mcp, 'github', None):
-                        print("❌ GitHub MCP tools not available")
+                        print("❌ GitHub MCP tools not available - agent_v2.py:3060")
                         continue
                     if not args:
-                        print("\n🐙 GitHub Commands:")
+                        print("\n🐙 GitHub Commands: - agent_v2.py:3063")
                         print(
                             "/github auth                Check GitHub authentication")
                         print(
@@ -2838,10 +3098,10 @@ async def main():
                                 print(
                                     f"Public repos: {user.get('public_repos', 0)}")
                         elif subcmd == "repos":
-                            print("📦 Fetching repositories...")
+                            print("📦 Fetching repositories... - agent_v2.py:3101")
                             repos = agent.mcp.github.list_repos()
                             if isinstance(repos, dict) and "error" in repos:
-                                print(f"❌ {repos['error']}")
+                                print(f"❌ {repos['error']} - agent_v2.py:3104")
                             elif repos:
                                 print(
                                     f"\n📦 Your Repositories ({len(repos)}):")
@@ -2851,7 +3111,7 @@ async def main():
                                     print(
                                         f"• {repo['full_name']} ⭐{stars} [{lang}]")
                                 if len(repos) > 20:
-                                    print(f"... and {len(repos) - 20} more")
+                                    print(f"... and {len(repos) - 20} more - agent_v2.py:3114")
                             else:
                                 print(
                                     "❌ No repositories found or authentication failed")
@@ -2861,7 +3121,7 @@ async def main():
                                 f"📦 Fetching {repo_name}...")
                             repo = agent.mcp.github.get_repo(repo_name)
                             if "error" in repo:
-                                print(f"❌ {repo['error']}")
+                                print(f"❌ {repo['error']} - agent_v2.py:3124")
                             elif repo:
                                 print(
                                     f"\n📦 {repo['full_name']}")
@@ -2933,7 +3193,7 @@ async def main():
                                     print(
                                         f"{item['html_url']}")
                             else:
-                                print("No results found")
+                                print("No results found - agent_v2.py:3196")
                         else:
                             print(
                                 "❌ Unknown GitHub command. Use /github for help.")
@@ -2951,13 +3211,13 @@ async def main():
                         "• /mcp           Show all MCP tools status")
                     print(
                         "• /search_web    Web search via Brave API")
-                    print("• /memory        Knowledge graph storage")
-                    print("• /github        GitHub API operations")
+                    print("• /memory        Knowledge graph storage - agent_v2.py:3214")
+                    print("• /github        GitHub API operations - agent_v2.py:3215")
                     continue
 
                 elif cmd == "search":
                     if not args:
-                        print("Usage: /search <query>")
+                        print("Usage: /search <query> - agent_v2.py:3220")
                     elif agent.rag:
                         query = " ".join(args)
                         hits = agent.rag.hybrid_search(query, k=10, final_k=5)
@@ -2969,15 +3229,15 @@ async def main():
                             print(
                                 f"{h['content'][:150]}...")
                     else:
-                        print("RAG not available")
+                        print("RAG not available - agent_v2.py:3232")
                     continue
 
                 elif cmd == "run":
                     if not args:
-                        print("Usage: /run <script.py>")
+                        print("Usage: /run <script.py> - agent_v2.py:3237")
                     else:
                         script = args[0]
-                        print(f"Running: {script}")
+                        print(f"Running: {script} - agent_v2.py:3240")
                         try:
                             r = subprocess.run(
                                 [sys.executable, script] if script.endswith('.py') else [
@@ -2992,21 +3252,21 @@ async def main():
                             print(
                                 f"[Exit code: {r.returncode}]")
                         except subprocess.TimeoutExpired:
-                            print("Script timed out (300s)")
+                            print("Script timed out (300s) - agent_v2.py:3255")
                         except Exception as e:
-                            print(f"Error: {e}")
+                            print(f"Error: {e} - agent_v2.py:3257")
                     continue
 
                 elif cmd == "skill":
                     if not agent.skill_manager:
-                        print("Skill Manager not available")
+                        print("Skill Manager not available - agent_v2.py:3262")
                     elif not args:
                         skills = agent.skill_manager.list_skills() if hasattr(
                             agent.skill_manager, 'list_skills') else []
                         print(
                             f"Available skills: {', '.join(skills) if skills else 'none'}")
                     else:
-                        print(f"Skill set to: {args[0]}")
+                        print(f"Skill set to: {args[0]} - agent_v2.py:3269")
                     continue
 
                 elif cmd == "robin":
@@ -3023,16 +3283,16 @@ async def main():
                         new_task = True
                         args = args[1:]
                     if not args:
-                        print("Provide a message after 'new'.")
+                        print("Provide a message after 'new'. - agent_v2.py:3286")
                         continue
                     message = " ".join(args)
                     response = agent.process_tool_query(
                         message, new_task=new_task)
-                    print(f"\n🦜 Robin:\n{response}")
+                    print(f"\n🦜 Robin:\n{response} - agent_v2.py:3291")
                     continue
 
                 else:
-                    print(f"Unknown command: /{cmd}")
+                    print(f"Unknown command: /{cmd} - agent_v2.py:3295")
                     continue
 
             # Auto-detect URLs
@@ -3046,7 +3306,7 @@ async def main():
                         print(result[:4000])
                         continue
                 elif agent.web_scraper:
-                    print("🌐 URL detected  scraping...")
+                    print("🌐 URL detected  scraping... - agent_v2.py:3309")
                     result = agent.execute_web_command("web", [user_input])
                     print(result[:4000])
                     continue
@@ -3068,7 +3328,7 @@ async def main():
                 if any(p in _low for p in _op_phrases):
                     print()
                     response = agent.process_tool_query(user_input)
-                    print(f"\n🦜 Robin:\n{response}")
+                    print(f"\n🦜 Robin:\n{response} - agent_v2.py:3331")
                     continue
 
             # Process query
@@ -3085,23 +3345,24 @@ async def main():
                         line, width=terminal_width - 2) or [""])
                 else:
                     wrapped.append(line)
-            print(f"\n🤖 Assistant:\n" + "\n".join(wrapped))
+            print(_cli_banner("LARRY GFORCE - agent_v2.py:3348", subtitle="ASSISTANT", role="ASSISTANT"))
+            print(_style_response("\n - agent_v2.py:3349".join(wrapped)))
 
         except KeyboardInterrupt:
             agent.save_memory_handoff("keyboard_interrupt")
             if readline:
                 readline.write_history_file(history_file)
-            print("\n👋 Goodbye!")
+            print("\n👋 Goodbye! - agent_v2.py:3355")
             break
         except EOFError:
             agent.save_memory_handoff("eof")
             if readline:
                 readline.write_history_file(history_file)
-            print("\n👋 Goodbye!")
+            print("\n👋 Goodbye! - agent_v2.py:3361")
             break
         except Exception as e:
             logger.error(f"Error: {e}")
-            print(f"❌ Error: {e}")
+            print(f"❌ Error: {e} - agent_v2.py:3365")
 
 
 if __name__ == "__main__":

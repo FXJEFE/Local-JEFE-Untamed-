@@ -34,7 +34,7 @@ try:
     NATIVE_SERVERS_AVAILABLE = True
 except ImportError:
     NATIVE_SERVERS_AVAILABLE = False
-    logger.info("Native in-process mcp_servers package not found (this is normal for the FXJEFE distribution). External MCP servers will be used instead.")
+    logger.info("Native MCP servers not present in this distribution (expected). Using external/configured MCP servers instead.")
 
 
 @dataclass
@@ -134,7 +134,7 @@ class MCPClient:
     def _init_servers(self):
         """Initialize native MCP servers."""
         if not NATIVE_SERVERS_AVAILABLE:
-            logger.warning("Native servers not available")
+            logger.debug("Native MCP servers not available (using external only)")
             return
 
         # Import lazily via the registry so missing optional deps don't crash

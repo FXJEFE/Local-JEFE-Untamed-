@@ -15,14 +15,24 @@
     },
     "ollama": {
         "host": "http://localhost:11434",
-        "default_model": "dolphin-mixtral:8x7b",
+        "_default_model_comment": "VRAM-friendly tool model for the RTX 4060 8GB. qwen3:8b is ~5.2GB and already installed (Qwen3, strong tool/function calling). Was dolphin-mixtral:8x7b (~26GB, CPU). Heavy models remain available via the profile tiers below.",
+        "default_model": "qwen3:8b",
         "embedding_model": "nomic-embed-text:latest",
-        "timeout": 1800,
+        "timeout": null,
         "num_parallel": 1,
         "keep_alive": "10m",
         "num_gpu": 0,
-        "cli_default_model": "dolphin-mixtral:8x7b",
-        "telegram_default_model": "dolphinecoder:15b"
+        "cli_default_model": "qwen3:8b",
+        "telegram_default_model": "qwen3:8b"
+    },
+    "fullstack": {
+        "_comment": "Controls launchers/start_fullstack.py (the 'Larry Full Stack' dashboard service + system launcher).",
+        "install_deps": true,
+        "start_ollama": true,
+        "start_telegram": true,
+        "fast_tool_model": "qwen3:8b",
+        "fast_tool_modelfile": "",
+        "_fast_tool_modelfile_comment": "Leave empty to `ollama pull` fast_tool_model. Set to e.g. 'ollama_modelfiles/Modelfile.Larry-Fast-9b' to `ollama create` a custom model instead."
     },
     "profiles": {
         "default": "ACCURACY",
@@ -53,8 +63,8 @@
         "tier3_fast_models": [
             "ministral-3:latest",
             "mistral:latest",
-            "qwen2.5:7b-instruct-q5_K_M",
-            "qwen2.5:7b-instruct"
+            "qwen3:8b-q5_K_M",
+            "qwen3:8b"
         ],
         "tier4_tiny_models": [
             "llama3.2:latest",

@@ -1,0 +1,45 @@
+{
+  "captured": "2026-06-04T04:30:42",
+  "agent_name": "LARRY G-FORCE",
+  "config_version": "2.0.0",
+  "interpreter": "C:\\Users\\LocalLarry\\AppData\\Local\\Programs\\Python\\Python311\\python.EXE",
+  "venv": "C:\\Users\\LocalLarry\\Documents\\LocalLarry\\GITHUB\\.venv",
+  "default_model": "qwen3:8b",
+  "fast_tool_model": "qwen3:8b",
+  "ollama_host": "http://localhost:11434",
+  "dashboard_port": 3777,
+  "files": {
+    "larry_config.json": {
+      "path": "C:\\Users\\LocalLarry\\Documents\\LocalLarry\\GITHUB\\larry_config.json",
+      "present": true
+    },
+    "mcp.json": {
+      "path": "C:\\Users\\LocalLarry\\Documents\\LocalLarry\\GITHUB\\mcp.json",
+      "present": true
+    },
+    ".env (secrets)": {
+      "path": "C:\\Users\\LocalLarry\\Documents\\LocalLarry\\GITHUB\\.env",
+      "present": true
+    },
+    "system prompt": {
+      "path": "C:\\Users\\LocalLarry\\Documents\\LocalLarry\\GITHUB\\prompts\\LARRY_SYSTEM_PROMPT.md",
+      "present": true
+    }
+  },
+  "state_locations": {
+    "config": "C:\\Users\\LocalLarry\\Documents\\LocalLarry\\GITHUB\\larry_config.json",
+    "mcp": "C:\\Users\\LocalLarry\\Documents\\LocalLarry\\GITHUB\\mcp.json",
+    "secrets": "C:\\Users\\LocalLarry\\Documents\\LocalLarry\\GITHUB\\.env",
+    "agent_status": "C:\\Users\\LocalLarry\\Documents\\LocalLarry\\GITHUB\\logs\\agent_status.json",
+    "memory": [
+      "C:\\Users\\LocalLarry\\Documents\\LocalLarry\\GITHUB\\memory.json",
+      "C:\\Users\\LocalLarry\\Documents\\LocalLarry\\GITHUB\\data\\larry_memory.json"
+    ],
+    "conversation": "C:\\Users\\LocalLarry\\Documents\\LocalLarry\\GITHUB\\data\\conversation_history.json",
+    "context_db": "C:\\Users\\LocalLarry\\Documents\\LocalLarry\\GITHUB\\data\\unified_context.db",
+    "rag_chroma": "C:\\Users\\LocalLarry\\Documents\\LocalLarry\\GITHUB\\chroma_db",
+    "dashboard_auth": "C:\\Users\\LocalLarry\\Documents\\LocalLarry\\GITHUB\\db\\dashboard_auth.json",
+    "saved_db": "C:\\Users\\LocalLarry\\Documents\\LocalLarry\\GITHUB\\db",
+    "logs": "C:\\Users\\LocalLarry\\Documents\\LocalLarry\\GITHUB\\logs"
+  }
+}

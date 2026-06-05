@@ -374,7 +374,7 @@ class ModelRouter:
         self.port = port
         self.base_url = f"http://{host}:{port}"
         self.available_models: List[str] = []
-        self.current_model: str = "llama3.2:3b"  # Default fallback
+        self.current_model: str = "dolphin-mixtral:8x7b"  # Base model for CLI
         self.refresh_models()
     
     def refresh_models(self) -> List[str]:
@@ -570,6 +570,10 @@ class ModelRouter:
         logger.info(f"Switched to model: {model_name}")
         return True
 
+    def list_available_models(self):
+        """Compatibility alias used by validate_system.py and dashboards."""
+        return list(self.available_models) if hasattr(self, "available_models") else self.refresh_models()
+
 
 # Convenience functions
 _router = None
@@ -577,27 +581,51 @@ _router = None
 def get_router() -> ModelRouter:
     """Get or create the global model router.
     
-    FXJEFE Local Larry: Respects larry_config.json ollama.timeout when available.
+    FXJEFE Local Larry: Extremely defensive — never returns None even under import/path hell.
+    This version is used by telegram_bot.py and root-level scripts.
     """
     global _router
-    if _router is None:
+    if _router is not None:
+        return _router
+
+    try:
+        import json
+        from pathlib import Path
+
+        # Try multiple locations because of sys.path games in this project
+        candidates = [
+            Path(__file__).parent / "larry_config.json",
+            Path(__file__).parent.parent / "larry_config.json",
+            Path("C:/Users/LocalLarry/Documents/LocalLarry/GITHUB/larry_config.json"),
+            Path("C:/Users/LocalLarry/Documents/LocalLarry/GITHUB/config/larry_config.json"),
+        ]
+        cfg = {}
+        for c in candidates:
+            if c.exists():
+                try:
+                    cfg = json.loads(c.read_text(encoding="utf-8"))
+                    break
+                except Exception:
+                    pass
+
+        _router = ModelRouter()
+    except Exception as e:
+        # Last-ditch: still return a working router object
+        logger.error(f"get_router() hard failure, creating minimal router: {e}")
         try:
-            import json
-            from pathlib import Path
-            cfg_path = Path(__file__).parent / "larry_config.json"
-            if cfg_path.exists():
-                with open(cfg_path, "r", encoding="utf-8") as f:
-                    cfg = json.load(f)
-                ollama_cfg = cfg.get("ollama", {})
-                configured_timeout = ollama_cfg.get("timeout")
-                if configured_timeout and isinstance(configured_timeout, (int, float)):
-                    _router = ModelRouter()
-                    # Note: actual per-call timeout still passed to generate()
-                    # This just documents the intent from config
-            else:
-                _router = ModelRouter()
-        except Exception:
             _router = ModelRouter()
+        except Exception:
+            # Nuclear fallback - create a dummy that won't crash the bot/agent
+            class _DummyRouter:
+                available_models = ["dolphin-mixtral:8x7b"]
+                current_model = "dolphin-mixtral:8x7b"
+                def route_query(self, q): return ("dolphin-mixtral:8x7b", "chat", 32768)
+                def detect_task(self, q): return "chat"
+                def generate(self, prompt, **kw): return "Router temporarily unavailable. Is Ollama running?"
+                def set_model(self, m): return False
+                def refresh_models(self): return []
+                def get_models_info(self): return [{"name": "dolphin-mixtral:8x7b", "context_limit": 32768, "tasks": ["chat"], "description": "Base model"}]
+            _router = _DummyRouter()
     return _router
 
 def list_models() -> str:

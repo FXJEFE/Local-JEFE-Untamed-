@@ -8,7 +8,7 @@
 
 import werkzeug.serving
 from dashboard_auth import init_auth, reset_password
-from activity_stream import ActivityStream
+from activity_stream import ActivityStream, report_status, read_status
 import os
 import sys
 import json
@@ -39,6 +39,80 @@ except ImportError:
 logging.basicConfig(level=logging.WARNING)
 logger = logging.getLogger(__name__)
 
+# ── Agent Process Manager for Command Central v4.0 ───────────────────────────
+PROJECT_ROOT = Path(__file__).parent.resolve()
+PYTHON = sys.executable
+
+AGENT_PROCESSES: Dict[str, subprocess.Popen] = {}   # "agent_v2" | "telegram_bot" → Popen
+
+def _get_agent_script(name: str) -> Path:
+    if name == "agent_v2":
+        return PROJECT_ROOT / "agent_v2.py"
+    if name == "telegram_bot":
+        # The bot lives in src/; fall back to root for older layouts.
+        src = PROJECT_ROOT / "src" / "telegram_bot.py"
+        return src if src.exists() else PROJECT_ROOT / "telegram_bot.py"
+    raise ValueError(f"Unknown agent: {name}")
+
+def start_agent(name: str) -> dict:
+    if name in AGENT_PROCESSES and AGENT_PROCESSES[name].poll() is None:
+        return {"success": False, "error": f"{name} is already running"}
+
+    script = _get_agent_script(name)
+    if not script.exists():
+        return {"success": False, "error": f"Script not found: {script}"}
+
+    try:
+        proc = subprocess.Popen(
+            [PYTHON, str(script)],
+            cwd=str(PROJECT_ROOT),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            creationflags=subprocess.CREATE_NEW_CONSOLE if os.name == "nt" else 0
+        )
+        AGENT_PROCESSES[name] = proc
+        report_status(name, status="STARTING", extra={"pid": proc.pid})
+        ActivityStream(name).emit(ActivityStream.SYSTEM, f"{name} started via Command Central (PID {proc.pid})")
+        return {"success": True, "pid": proc.pid}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+def stop_agent(name: str) -> dict:
+    if name not in AGENT_PROCESSES:
+        return {"success": False, "error": f"{name} is not being managed"}
+
+    proc = AGENT_PROCESSES[name]
+    if proc.poll() is not None:
+        del AGENT_PROCESSES[name]
+        return {"success": True, "message": "Already stopped"}
+
+    try:
+        proc.terminate()
+        try:
+            proc.wait(timeout=8)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        del AGENT_PROCESSES[name]
+        report_status(name, status="STOPPED")
+        ActivityStream(name).emit(ActivityStream.SYSTEM, f"{name} stopped via Command Central")
+        return {"success": True}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+def get_agent_status(name: str) -> dict:
+    if name not in AGENT_PROCESSES:
+        return {"running": False, "status": "STOPPED"}
+
+    proc = AGENT_PROCESSES[name]
+    alive = proc.poll() is None
+    return {
+        "running": alive,
+        "pid": proc.pid if alive else None,
+        "status": "RUNNING" if alive else "CRASHED"
+    }
+
 
 # Pre-import security modules (no app reference yet)
 try:
@@ -55,12 +129,41 @@ except Exception as _ste:
     _SEC_IMPORT_ERR = _ste
 
 PROJECT_ROOT = Path(__file__).parent.resolve()
-DASHBOARD_PORT = 3777
-HOST = "127.0.0.1"
+IS_WINDOWS = os.name == "nt"
+
+
+def _load_cfg() -> dict:
+    try:
+        return json.loads((PROJECT_ROOT / "larry_config.json").read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+_CFG = _load_cfg()
+DASHBOARD_PORT = _CFG.get("dashboard", {}).get("port", 3777)
+HOST           = _CFG.get("dashboard", {}).get("host", "127.0.0.1")
+
+
+def _get_browser_path() -> str:
+    """Return preferred browser exe path from config, or '' to use system default."""
+    browsers = _CFG.get("browser", {})
+    if IS_WINDOWS:
+        for key in ("brave_windows", "chrome_windows", "firefox_windows"):
+            p = browsers.get(key, "")
+            if p and os.path.isfile(p):
+                return p
+    else:
+        for key in ("brave_linux",):
+            p = browsers.get(key, "")
+            if p and os.path.isfile(p):
+                return p
+        for candidate in ("/usr/bin/brave-browser", "/usr/bin/chromium-browser", "/usr/bin/google-chrome"):
+            if os.path.isfile(candidate):
+                return candidate
+    return ""
+
 
 # Dual-boot aware: this PC runs both Windows and Linux. Detect at runtime and
 # keep both code paths — never assume one OS.
-IS_WINDOWS = os.name == "nt"
 
 
 def venv_python(venv_dir: Path) -> Path:
@@ -98,9 +201,21 @@ running_services: Dict[str, subprocess.Popen] = {}
 _FX_SCRIPTS = str(PROJECT_ROOT / "FXJEFE_Project" / "Scripts")
 _FX_SERVERS = str(PROJECT_ROOT / "FXJEFE_Project" / "Servers")
 AVAILABLE_SERVICES = {
-    "agent_larry":       {"name": "Larry Agent CLI",   "script": "agent_v2.py",          "port": 3778,  "icon": "🤖", "cwd": str(PROJECT_ROOT / "src"), "terminal": True},
-    "telegram_bot":      {"name": "Telegram Bot",      "script": "telegram_bot.py",      "port": None,  "icon": "✈️",  "cwd": str(PROJECT_ROOT / "src")},
-    "security_sentinel": {"name": "Security Sentinel", "script": "security_sentinel.py", "port": None,  "icon": "🛡️", "cwd": None},
+    "agent_larry":       {"name": "Larry Agent CLI",   "script": "agent_v2.py",          "port": None,  "icon": "🤖", "cwd": str(PROJECT_ROOT), "terminal": True},
+    "telegram_bot":      {"name": "Telegram Bot",      "script": "src/telegram_bot.py",  "port": None,  "icon": "✈️",  "cwd": str(PROJECT_ROOT)},
+    "security_sentinel": {"name": "Security Sentinel", "script": "security_sentinel.py", "port": None,  "icon": "🛡️", "cwd": str(PROJECT_ROOT)},
+
+    # Full-stack launcher: ensures venv+deps+config, starts Ollama with the
+    # Larry-Fast-9b tool model, then the Telegram bot, and supervises them.
+    # The file lives in launchers/ but we set cwd=launchers/ so the script
+    # basename appears in the process cmdline for _find_running_pid().
+    "larry_fullstack":   {"name": "Larry Full Stack",  "script": "start_fullstack.py",   "port": None,  "icon": "🟢", "cwd": str(PROJECT_ROOT / "launchers")},
+
+    # Setup + startup of THIS exact configured version, runnable from the UI.
+    # Setup: build/select interpreter + deps, pull qwen3:8b, snapshot VERSION_STATE.json.
+    # Startup: bring up dashboard + full stack together (the boot/login entry point).
+    "larry_setup":       {"name": "Setup (this version)",  "script": "setup_larry_version.py", "port": None, "icon": "🧩", "cwd": str(PROJECT_ROOT / "launchers"), "terminal": True},
+    "larry_startup":     {"name": "Startup (full system)", "script": "start_system.py", "args": ["--no-browser"], "port": None, "icon": "🏁", "cwd": str(PROJECT_ROOT / "launchers")},
 
     # FXJEFE canonical ensemble server (the EA calls this one).
     "fxjefe_main":       {"name": "AI Server (ensemble)", "script": "ai_server_golden.py", "port": 47820, "icon": "💹", "cwd": _FX_SCRIPTS},
@@ -138,7 +253,9 @@ TEMP_LABELS = {
 
 def get_system_health():
     try:
-        cpu = psutil.cpu_percent(interval=0.3)
+        # interval=None returns 0.0 on the first call (no delta yet); a short
+        # blocking sample gives a real CPU% reading on every poll.
+        cpu = psutil.cpu_percent(interval=0.2)
         mem = psutil.virtual_memory()
         # OS-correct root (C:\ or /)
         disk = psutil.disk_usage(PROJECT_ROOT.anchor)
@@ -381,17 +498,54 @@ def run_port_scan(target: str = "localhost", ports: str = "1-1024"):
         return {"error": str(e)}
 
 
+_proc_cache: dict = {"ts": 0.0, "data": []}
+_PROC_TTL = 5.0  # seconds between full process scans
+
 def get_top_processes(n=10):
+    now = time.time()
+    if now - _proc_cache["ts"] < _PROC_TTL:
+        return _proc_cache["data"]
     procs = []
-    for p in sorted(psutil.process_iter(["pid", "name", "cpu_percent", "memory_percent", "status"]),
-                    key=lambda x: x.info.get("cpu_percent") or 0, reverse=True)[:n]:
-        procs.append({
-            "pid": p.info["pid"],
-            "name": p.info["name"][:20],
-            "cpu": round(p.info.get("cpu_percent") or 0, 1),
-            "mem": round(p.info.get("memory_percent") or 0, 1),
-            "status": p.info.get("status", ""),
-        })
+    try:
+        # First pass: touch every process so psutil can start measuring CPU delta
+        snap = list(psutil.process_iter(["pid", "name", "cpu_percent", "memory_percent", "status"]))
+        for p in snap:
+            try:
+                p.cpu_percent()  # prime the counter (returns 0, discarded)
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+        # Brief interval so the second call returns a real delta
+        time.sleep(0.15)
+        # Normalize per-process CPU to a share of the WHOLE machine. psutil
+        # reports CPU per-core, so a single busy thread can read >100%; dividing
+        # by the logical-CPU count keeps every row in 0-100% and matches the
+        # system CPU gauge.
+        ncpu = psutil.cpu_count() or 1
+        # Second pass: read actual values
+        rows = []
+        for p in snap:
+            try:
+                pid = p.info["pid"]
+                # PID 0 ("System Idle Process" on Windows / swapper on Linux) is
+                # not a real, killable process — its "CPU%" is just unused
+                # capacity (it reads near ncpu*100%). Never list it.
+                if pid == 0 or (p.info.get("name") or "") == "System Idle Process":
+                    continue
+                cpu = (p.cpu_percent() or 0) / ncpu
+                rows.append({
+                    "pid": pid,
+                    "name": (p.info.get("name") or "")[:20],
+                    "cpu": round(cpu, 1),
+                    "mem": round(p.info.get("memory_percent") or 0, 1),
+                    "status": p.info.get("status", ""),
+                })
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+        procs = sorted(rows, key=lambda x: x["cpu"], reverse=True)[:n]
+    except Exception:
+        pass
+    _proc_cache["ts"] = time.time()
+    _proc_cache["data"] = procs
     return procs
 
 
@@ -442,13 +596,34 @@ def api_network():
                     "telegram": get_telegram_status()})
 
 
+def _find_running_pid(script_name: str) -> Optional[int]:
+    """Scan psutil for a python process running script_name."""
+    try:
+        for p in psutil.process_iter(["pid", "name", "cmdline"]):
+            try:
+                cmd = p.info.get("cmdline") or []
+                if any(script_name in str(a) for a in cmd):
+                    return p.info["pid"]
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+    except Exception:
+        pass
+    return None
+
+
 @app.route("/api/services/status")
 def api_services_status():
     out = {}
     for sid, sinfo in AVAILABLE_SERVICES.items():
         proc = running_services.get(sid)
+        managed_running = proc is not None and proc.poll() is None
+        # Also detect processes started outside the dashboard (or after a restart)
+        ext_pid = None
+        if not managed_running:
+            ext_pid = _find_running_pid(sinfo["script"])
         out[sid] = {
-            "running": proc is not None and proc.poll() is None,
+            "running": managed_running or (ext_pid is not None),
+            "pid": (proc.pid if managed_running else ext_pid),
             "port": sinfo["port"],
             "name": sinfo["name"],
             "icon": sinfo["icon"],
@@ -464,6 +639,9 @@ def api_start_service(sid):
     proc = running_services.get(sid)
     if proc and proc.poll() is None:
         return jsonify({"success": False, "error": "Already running"}), 400
+    ext_pid = _find_running_pid(sinfo["script"])
+    if ext_pid:
+        return jsonify({"success": False, "error": f"Already running (external PID {ext_pid})"}), 400
     work_dir = Path(sinfo["cwd"]) if sinfo.get("cwd") else PROJECT_ROOT
     script = work_dir / sinfo["script"]
     if not script.exists():
@@ -516,7 +694,7 @@ def api_start_service(sid):
             return jsonify({"success": True, "message": f"{sinfo['name']} opened in terminal (PID {p.pid})"})
 
         # Background/daemon services
-        log_dir = work_dir / "Logs"
+        log_dir = PROJECT_ROOT / "logs"
         log_dir.mkdir(parents=True, exist_ok=True)
         log_out = open(log_dir / f"{sid}.log", "a")
         cmd = [py, str(script)] + sinfo.get("args", [])
@@ -551,8 +729,9 @@ def api_kill_process():
         return jsonify({"success": False, "error": "No PID provided"}), 400
     try:
         pid = int(pid)
-        # Safety: never kill PID 1, own PID, or dashboard PID
-        if pid in (1, os.getpid(), os.getppid()):
+        # Safety: never kill OS pseudo-processes (0 = System Idle, 4 = System),
+        # PID 1, own PID, or the dashboard's parent.
+        if pid in (0, 1, 4, os.getpid(), os.getppid()):
             return jsonify({"success": False, "error": "Protected process"}), 403
         proc = psutil.Process(pid)
         name = proc.name()
@@ -684,6 +863,73 @@ def api_listening():
     return jsonify({"services": get_listening_services()})
 
 
+LOGS_DIR = PROJECT_ROOT / "logs"
+
+@app.route("/api/logs")
+def api_logs():
+    """Return the last N lines from all log files in logs/."""
+    n = min(int(request.args.get("lines", 80)), 500)
+    log_file = request.args.get("file", "")
+    lines_out = []
+    try:
+        if log_file:
+            candidates = [LOGS_DIR / log_file]
+        else:
+            candidates = sorted(
+                (f for f in LOGS_DIR.iterdir() if f.suffix in (".log", ".jsonl") and f.is_file()),
+                key=lambda f: f.stat().st_mtime, reverse=True
+            )[:4]
+        for path in candidates:
+            if not path.exists():
+                continue
+            try:
+                with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                    raw = fh.readlines()
+                tail = raw[-n:] if len(raw) > n else raw
+                for ln in tail:
+                    lines_out.append({"file": path.name, "line": ln.rstrip()})
+            except Exception:
+                pass
+    except Exception as e:
+        return jsonify({"error": str(e), "lines": []})
+    return jsonify({"lines": lines_out[-n:]})
+
+
+@app.route("/api/telegram/status")
+def api_telegram_status():
+    """Live view of active long prompt sessions and heavy tasks from the Telegram bot."""
+    status_file = PROJECT_ROOT / "logs" / "telegram_live_status.json"
+    if not status_file.exists():
+        return jsonify({
+            "timestamp": datetime.now().isoformat(),
+            "active_sessions": 0,
+            "heavy_tasks": [],
+            "long_prompt_builders": {},
+            "heavy_task_details": {},
+            "message": "No live data yet (start telegram_bot.py)"
+        })
+
+    try:
+        data = json.loads(status_file.read_text(encoding="utf-8"))
+        return jsonify(data)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/logs/files")
+def api_logs_files():
+    """List available log files."""
+    try:
+        files = [
+            {"name": f.name, "size": f.stat().st_size, "mtime": f.stat().st_mtime}
+            for f in sorted(LOGS_DIR.iterdir(), key=lambda x: x.stat().st_mtime, reverse=True)
+            if f.suffix in (".log", ".jsonl") and f.is_file()
+        ]
+    except Exception:
+        files = []
+    return jsonify({"files": files})
+
+
 @app.route("/api/chat/save", methods=["POST"])
 def api_chat_save():
     """Save chat conversation to db/chats."""
@@ -796,7 +1042,7 @@ def api_security_quickscan():
     results.append({"check": "VPN Status", "status": "ok" if vpn_up else "warn",
                    "detail": "VPN active" if vpn_up else "NO VPN — traffic unprotected"})
     # Check resources
-    cpu = psutil.cpu_percent(interval=0.5)
+    cpu = psutil.cpu_percent(interval=None)
     mem = psutil.virtual_memory().percent
     results.append({"check": "CPU Load", "status": "warn" if cpu >
                    85 else "ok", "detail": f"{cpu:.0f}%"})
@@ -829,6 +1075,54 @@ def api_activity_stream():
     limit = int(request.args.get("limit", 100))
     events = ActivityStream.read_recent(since=since, limit=limit)
     return jsonify({"events": events})
+
+
+@app.route("/api/agent/status")
+def api_agent_status():
+    """Return current status of Agent v2, Telegram Bot, etc. for Command Central."""
+    status = ActivityStream.read_status() if hasattr(ActivityStream, "read_status") else {}
+    # Fallback: also read from file directly
+    if not status:
+        try:
+            from activity_stream import read_status as _read
+            status = _read()
+        except Exception:
+            status = {}
+    return jsonify(status)
+
+
+# ── Agent Control Endpoints (Start/Stop from UI) ──────────────────────────────
+@app.route("/api/agent/control", methods=["POST"])
+def api_agent_control():
+    data = request.get_json() or {}
+    name = data.get("name")          # "agent_v2" or "telegram_bot"
+    action = data.get("action")      # "start" or "stop"
+
+    if name not in ("agent_v2", "telegram_bot"):
+        return jsonify({"success": False, "error": "Invalid agent name"}), 400
+
+    if action == "start":
+        result = start_agent(name)
+    elif action == "stop":
+        result = stop_agent(name)
+    else:
+        return jsonify({"success": False, "error": "Invalid action"}), 400
+
+    return jsonify(result)
+
+
+@app.route("/api/agent/status")
+def api_agent_full_status():
+    """Enhanced status including managed processes + last known state."""
+    status = read_status() if 'read_status' in globals() else ActivityStream.read_status()
+
+    for name in ("agent_v2", "telegram_bot"):
+        live = get_agent_status(name)
+        if name not in status:
+            status[name] = {}
+        status[name].update(live)
+
+    return jsonify(status)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -871,12 +1165,38 @@ _mt5_cache = {
 }
 
 
+def _mt5_terminal_running() -> bool:
+    """True only if an MT5/FTMO terminal is ALREADY running.
+
+    Every _mt5.initialize() call is gated on this, because initialize() will
+    LAUNCH the terminal if it isn't running. The dashboard must NEVER auto-start
+    MT5 / FTMO — the user opens it themselves.
+    """
+    try:
+        for p in psutil.process_iter(["name", "exe"]):
+            try:
+                name = (p.info.get("name") or "").lower()
+                if name in ("terminal64.exe", "terminal.exe",
+                            "metatrader.exe", "metatrader5.exe"):
+                    return True
+                exe = (p.info.get("exe") or "").lower()
+                if "metatrader" in exe or "ftmo" in exe or "terminal64" in exe:
+                    return True
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+    except Exception:
+        pass
+    return False
+
+
 def _mt5_poll_once():
     """One MetaTrader5 read into a snapshot dict. Runs on the poller thread."""
     snap = {"available": True, "connected": False, "reason": "",
             "updated": datetime.now().strftime("%H:%M:%S")}
     try:
-        if not _mt5.initialize():
+        if not _mt5_terminal_running():
+            snap["reason"] = "MT5 terminal not open (auto-launch disabled)"
+        elif not _mt5.initialize():
             snap["reason"] = "MT5 terminal not running"
         else:
             acc = _mt5.account_info()
@@ -936,7 +1256,8 @@ def api_mt5_status():
         cache = dict(_mt5_cache)
 
     # If we have the package but not connected, try a quick one-shot init
-    if MT5_AVAILABLE and _mt5 is not None and not cache.get("connected"):
+    if (MT5_AVAILABLE and _mt5 is not None and not cache.get("connected")
+            and _mt5_terminal_running()):
         try:
             with _mt5_lock:
                 if not _mt5.initialize():
@@ -970,6 +1291,11 @@ def api_mt5_connect():
     """Force reconnect to the running MT5 terminal (useful after MT5 restart/login)."""
     if not MT5_AVAILABLE or _mt5 is None:
         return jsonify({"success": False, "error": "MetaTrader5 package not available"}), 400
+
+    # Never launch the terminal. Require the user to have MT5/FTMO open first.
+    if not _mt5_terminal_running():
+        return jsonify({"success": False,
+                        "error": "MT5/FTMO terminal is not open. Open and log in first — the dashboard will not launch it."}), 409
 
     with _mt5_lock:
         try:
@@ -1110,6 +1436,8 @@ def api_mt5_trade():
         return jsonify({"success": False, "error": "Need symbol, side (BUY/SELL), volume>0"}), 400
     with _mt5_lock:
         try:
+            if not _mt5_terminal_running():
+                return jsonify({"success": False, "error": "MT5/FTMO terminal is not open — open it first (dashboard will not launch it)"}), 409
             if not _mt5.initialize():
                 return jsonify({"success": False, "error": "MT5 not running"}), 503
             if not _mt5.symbol_select(symbol, True):
@@ -1160,6 +1488,8 @@ def api_mt5_close():
         return jsonify({"success": False, "error": "Need ticket"}), 400
     with _mt5_lock:
         try:
+            if not _mt5_terminal_running():
+                return jsonify({"success": False, "error": "MT5/FTMO terminal is not open — open it first (dashboard will not launch it)"}), 409
             if not _mt5.initialize():
                 return jsonify({"success": False, "error": "MT5 not running"}), 503
             ok, msg = _close_one(ticket)
@@ -1177,6 +1507,8 @@ def api_mt5_close_all():
         return jsonify({"success": False, "error": "MetaTrader5 not available on this OS"}), 503
     with _mt5_lock:
         try:
+            if not _mt5_terminal_running():
+                return jsonify({"success": False, "error": "MT5/FTMO terminal is not open — open it first (dashboard will not launch it)"}), 409
             if not _mt5.initialize():
                 return jsonify({"success": False, "error": "MT5 not running"}), 503
             positions = _mt5.positions_get() or []
@@ -1195,10 +1527,19 @@ def api_mt5_close_all():
 
 
 # --- MCP server catalog --------------------------------------------------
-# The agent's MCP config lives in LocalLarry/mcp.json (and a mirror in
-# Documents/mcp.json). The dashboard reads it for a status panel; the agent
-# process itself loads the servers when it starts.
-MCP_CONFIG_PATH = PROJECT_ROOT / "LocalLarry" / "mcp.json"
+# The agent's MCP config. On this machine it lives at the repo root
+# (GITHUB/mcp.json); other layouts kept it under LocalLarry/ or config/ or a
+# Documents mirror. Resolve to whichever actually exists so the panel works.
+def _resolve_mcp_config() -> Path:
+    for c in (PROJECT_ROOT / "mcp.json",
+              PROJECT_ROOT / "config" / "mcp.json",
+              PROJECT_ROOT / "LocalLarry" / "mcp.json",
+              Path.home() / "Documents" / "mcp.json"):
+        if c.exists():
+            return c
+    return PROJECT_ROOT / "mcp.json"
+
+MCP_CONFIG_PATH = _resolve_mcp_config()
 
 
 def _mcp_dep_status(server):
@@ -1247,6 +1588,53 @@ def api_mcp_list():
         return jsonify({"ok": False, "error": f"mcp.json not found at {MCP_CONFIG_PATH}"}), 404
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/health/services")
+def api_health_services():
+    """Compact Agent / Ollama / MCP health for the panel below GPU STATUS."""
+    # --- Agent: any of the agent-family processes alive? ---
+    agent_pids = {}
+    for label, script in (("agent", "agent_v2.py"),
+                          ("fullstack", "start_fullstack.py"),
+                          ("telegram", "telegram_bot.py")):
+        pid = _find_running_pid(script)
+        if pid:
+            agent_pids[label] = pid
+    agent_up = bool(agent_pids)
+
+    # --- Ollama: reachable? how many models? what's loaded in VRAM? ---
+    ollama_up = False
+    model_count = 0
+    if _req is not None:
+        try:
+            r = _req.get("http://localhost:11434/api/tags", timeout=3)
+            ollama_up = r.status_code == 200
+            model_count = len(r.json().get("models", []))
+        except Exception:
+            ollama_up = False
+    loaded = get_ollama_running() if ollama_up else []
+
+    # --- MCP: enabled / dependency-ready counts from mcp.json ---
+    mcp = {"ok": False, "enabled": 0, "count": 0, "ready": 0}
+    try:
+        with open(MCP_CONFIG_PATH, "r", encoding="utf-8") as f:
+            mcfg = json.load(f)
+        servers = mcfg.get("servers", [])
+        enabled = [s for s in servers if s.get("enabled")]
+        ready = [s for s in enabled if _mcp_dep_status(s) == "ready"]
+        mcp = {"ok": True, "count": len(servers),
+               "enabled": len(enabled), "ready": len(ready)}
+    except Exception as e:
+        mcp = {"ok": False, "error": str(e), "enabled": 0, "count": 0, "ready": 0}
+
+    return jsonify({
+        "agent":  {"up": agent_up, "pids": agent_pids},
+        "ollama": {"up": ollama_up, "loaded": loaded, "models": model_count,
+                   "default_model": _CFG.get("ollama", {}).get("default_model", "")},
+        "mcp": mcp,
+        "ts": datetime.now().strftime("%H:%M:%S"),
+    })
 
 
 @app.route("/api/mcp/toggle", methods=["POST"])
@@ -2002,6 +2390,15 @@ header::after {
           <div id="gpu-detail"><span class="color-dim">Loading GPU data...</span></div>
         </div>
 
+        <!-- Agent / Ollama / MCP health (the free space below GPU STATUS) -->
+        <div class="panel" style="margin-bottom:12px">
+          <div class="panel-title"><span class="icon">❤</span> SERVICE HEALTH
+            <span class="badge badge-dim" id="health-ts" style="margin-left:auto;font-size:0.6rem">--</span>
+            <button class="btn btn-sm" style="padding:2px 8px;font-size:0.6rem;margin-left:6px" onclick="refreshServiceHealth()">↻</button>
+          </div>
+          <div id="health-services"><span class="color-dim" style="font-family:'Share Tech Mono';font-size:0.72rem">Checking agent · ollama · mcp ...</span></div>
+        </div>
+
         <!-- Top Processes -->
         <div class="panel">
           <div class="panel-title"><span class="icon">◈</span> TOP PROCESSES <span style="margin-left:auto" class="badge badge-dim" id="proc-count">-- procs</span></div>
@@ -2300,6 +2697,20 @@ header::after {
         <div class="panel-title"><span class="icon">⚙</span> MANAGED SERVICES</div>
         <div id="svc-list">Loading...</div>
       </div>
+
+      <!-- Telegram Live Monitor (Production) -->
+      <div class="panel" style="border-color: rgba(255,180,0,0.3)">
+        <div class="panel-title">
+          <span class="icon">✈️</span> TELEGRAM LIVE MONITOR
+          <span id="tg-monitor-badge" class="badge badge-dim" style="margin-left:8px">LIVE</span>
+        </div>
+        <div id="tg-monitor" style="font-family:'Share Tech Mono';font-size:0.78rem;line-height:1.35">
+          Loading Telegram session state...
+        </div>
+        <div style="margin-top:6px;font-size:0.7rem;color:var(--dim)">
+          Updates every 8s from telegram_bot.py status file
+        </div>
+      </div>
       <div class="panel">
         <div class="panel-title"><span class="icon">◎</span> SERVICE LOG</div>
         <div id="svc-log" class="terminal">
@@ -2331,8 +2742,18 @@ header::after {
         <div class="panel" style="margin-bottom:12px">
           <div class="panel-title"><span class="icon">◈</span> AGENT STATUS</div>
           <div id="activity-agents">
-            <div class="iface-row"><span class="iface-name">Agent v2 (CLI)</span><span id="agent-v2-status" class="badge badge-dim">IDLE</span></div>
-            <div class="iface-row"><span class="iface-name">Telegram Bot</span><span id="tg-bot-status" class="badge badge-dim">IDLE</span></div>
+            <div class="iface-row">
+                <span class="iface-name">Agent v2 (CLI)</span>
+                <span id="agent-v2-status" class="badge badge-dim">IDLE</span>
+                <button onclick="controlAgent('agent_v2', 'start')" style="margin-left:8px;font-size:10px;padding:1px 6px;">▶</button>
+                <button onclick="controlAgent('agent_v2', 'stop')" style="font-size:10px;padding:1px 6px;">⏹</button>
+            </div>
+            <div class="iface-row">
+                <span class="iface-name">Telegram Bot</span>
+                <span id="tg-bot-status" class="badge badge-dim">IDLE</span>
+                <button onclick="controlAgent('telegram_bot', 'start')" style="margin-left:8px;font-size:10px;padding:1px 6px;">▶</button>
+                <button onclick="controlAgent('telegram_bot', 'stop')" style="font-size:10px;padding:1px 6px;">⏹</button>
+            </div>
             <div class="iface-row"><span class="iface-name">Ollama Backend</span><span id="ollama-activity-status" class="badge badge-dim">IDLE</span></div>
           </div>
         </div>
@@ -2354,6 +2775,22 @@ header::after {
             <div class="iface-row"><span class="iface-name">Errors</span><span id="stat-errors" class="color-red">0</span></div>
           </div>
         </div>
+      </div>
+    </div>
+
+    <!-- LOG TAIL PANEL -->
+    <div class="panel" style="margin-top:12px">
+      <div class="panel-title"><span class="icon">📄</span> SYSTEM LOG TAIL
+        <span style="margin-left:auto;display:flex;gap:8px;align-items:center">
+          <select id="log-file-select" style="font-family:'Share Tech Mono';font-size:0.6rem;background:rgba(0,0,0,0.4);border:1px solid var(--border);color:var(--dim);padding:2px 4px" onchange="refreshLogs()">
+            <option value="">-- all recent --</option>
+          </select>
+          <span class="badge badge-dim" id="log-line-count">0 lines</span>
+          <button class="btn btn-sm" style="padding:2px 8px;font-size:0.5rem" onclick="refreshLogs()">REFRESH</button>
+        </span>
+      </div>
+      <div id="log-terminal" class="terminal" style="height:220px;font-size:0.65rem;overflow-y:auto;white-space:pre-wrap;word-break:break-all">
+        <span style="color:var(--dim)">// fetching logs...</span>
       </div>
     </div>
   </div>
@@ -2598,8 +3035,8 @@ function showTab(id) {
   if (id === 'models')   refreshModels();
   if (id === 'network')  refreshNetwork();
   if (id === 'security') { refreshListening(); secCenterInit(); }
-  if (id === 'services') refreshServices();
-  if (id === 'activity') refreshActivity();
+  if (id === 'services') { refreshServices(); refreshTelegramMonitor(); }
+  if (id === 'activity') { refreshActivity(); refreshAgentStatus(); }
   if (id === 'tools')    initToolsTab();
   if (id === 'db')       loadDB('');
 }
@@ -2964,6 +3401,38 @@ async function refreshServicesQuick() {
     const el = document.getElementById('svc-quick');
     if (el) el.innerHTML = html;
   } catch(e) {}
+}
+
+async function refreshTelegramMonitor() {
+  try {
+    const d = await fetch('/api/telegram/status').then(r => r.json());
+    const container = document.getElementById('tg-monitor');
+    if (!container) return;
+
+    let html = '';
+    html += `<div>Active sessions: <span class="color-cyan">${d.active_sessions || 0}</span></div>`;
+    html += `<div>Heavy tasks running: <span class="color-gold">${(d.heavy_tasks || []).length}</span></div>`;
+
+    if (d.long_prompt_builders && Object.keys(d.long_prompt_builders).length > 0) {
+      html += `<div style="margin-top:4px"><b>Long Prompt Builders:</b></div>`;
+      for (const [cid, info] of Object.entries(d.long_prompt_builders)) {
+        html += `<div style="padding-left:8px">• Chat ${cid}: ${info.parts} parts (since ${info.started ? info.started.substring(11,19) : '?'})</div>`;
+      }
+    }
+
+    if (d.heavy_task_details && Object.keys(d.heavy_task_details).length > 0) {
+      html += `<div style="margin-top:4px"><b>Active Heavy Work:</b></div>`;
+      for (const [cid, task] of Object.entries(d.heavy_task_details)) {
+        const short = (task || '').substring(0, 70);
+        html += `<div style="padding-left:8px">• ${cid}: ${short}...</div>`;
+      }
+    }
+
+    container.innerHTML = html || '<span style="color:var(--dim)">No active Telegram sessions right now.</span>';
+  } catch (e) {
+    const el = document.getElementById('tg-monitor');
+    if (el) el.innerHTML = '<span style="color:#f66">Failed to load Telegram status</span>';
+  }
 }
 
 async function startSvc(id) {
@@ -3395,7 +3864,7 @@ async function refreshActivity() {
       // Update agent status indicators
       if (ev.source === 'agent_v2') {
         const el = document.getElementById('agent-v2-status');
-        if (ev.type === 'generating') { el.className = 'badge badge-warn'; el.textContent = 'GENERATING'; }
+        if (ev.type === 'generating') { el.className = 'badge badge-warn'; el.textContent = 'GENERATING'; lastAgentActivity = Date.now(); }
         else if (ev.type === 'response_done') { el.className = 'badge badge-on'; el.textContent = 'READY'; }
         else if (ev.type === 'query_received') { el.className = 'badge badge-warn'; el.textContent = 'THINKING'; }
         else if (ev.type === 'system') { el.className = 'badge badge-on'; el.textContent = 'ONLINE'; }
@@ -3413,10 +3882,20 @@ async function refreshActivity() {
       const typeLabel = TYPE_LABEL[ev.type] || ev.type.toUpperCase();
       const line = document.createElement('div');
       line.className = 'ev';
+
+      let detailHtml = '';
+      if (ev.type === 'tool_dispatch' || ev.type === 'tool_call') {
+        detailHtml = `<span style="color:#f59e0b">→ ${ev.detail?.tool || ''}</span>`;
+      } else if (ev.type === 'execution') {
+        detailHtml = `<span style="color:#10b981">⚡ ${ev.detail?.command || ev.msg}</span>`;
+      } else if (ev.type === 'thinking') {
+        detailHtml = `<span style="color:#a78bfa">💭 ${ev.msg}</span>`;
+      }
+
       line.innerHTML = `<span class="ev-time">${ev.time || '--'}</span>`
         + `<span class="ev-src ${srcClass(ev.source)}">${srcLabel(ev.source)}</span>`
         + `<span class="ev-type ${typeCls}">[${typeLabel}]</span>`
-        + `<span>${ev.msg || ''}</span>`;
+        + `<span>${ev.msg || ''} ${detailHtml}</span>`;
       term.appendChild(line);
     });
 
@@ -3443,6 +3922,41 @@ async function refreshActivity() {
 function clearActivity() {
   document.getElementById('activity-terminal').innerHTML = '<div class="t-dim">// Terminal cleared</div>';
   activityStats = { queries: 0, gens: 0, rag: 0, tools: 0, errors: 0 };
+}
+
+// Poll agent status for Command Central panels (LAST MODEL, CONTEXT, etc.)
+async function refreshAgentStatus() {
+  try {
+    const res = await fetch('/api/agent/status').then(r => r.json());
+    if (res['agent_v2']) {
+      const s = res['agent_v2'];
+      const modelEl = document.getElementById('activity-last-model');
+      if (modelEl && s.model) modelEl.textContent = s.model;
+      const ctxEl = document.getElementById('activity-ctx-info');
+      if (ctxEl && s.context_tokens) ctxEl.textContent = `${s.context_tokens} tokens`;
+    }
+    if (res['telegram_bot']) {
+      const s = res['telegram_bot'];
+      const modelEl = document.getElementById('activity-last-model');
+      if (modelEl && s.model && !document.getElementById('activity-last-model').textContent.includes('agent')) {
+        // prefer agent_v2 if both reporting
+      }
+    }
+  } catch(e) { /* silent */ }
+}
+
+async function controlAgent(name, action) {
+  const res = await fetch('/api/agent/control', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({ name, action })
+  }).then(r => r.json());
+
+  if (!res.success) {
+    alert("Failed: " + (res.error || "Unknown error"));
+  } else {
+    setTimeout(refreshAgentStatus, 800);
+  }
 }
 
 // ── FXJEFE Trading (MT5) ──────────────────────────────────────────────
@@ -4075,19 +4589,103 @@ function quickDispatch(task) {
   agentDispatch();
 }
 
+// ── Log tail ─────────────────────────────────────────────────────────
+async function loadLogFiles() {
+  try {
+    const d = await fetch('/api/logs/files').then(r => r.json());
+    const sel = document.getElementById('log-file-select');
+    if (!sel) return;
+    while (sel.options.length > 1) sel.remove(1);
+    (d.files || []).forEach(f => {
+      const o = document.createElement('option'); o.value = f.name; o.textContent = f.name;
+      sel.appendChild(o);
+    });
+  } catch(e) {}
+}
+
+const LOG_COLORS = {
+  'ERROR': '#ff4444', 'WARNING': '#ffaa00', 'CRITICAL': '#ff0000',
+  'INFO': '#8888cc', 'DEBUG': '#555566',
+};
+
+async function refreshLogs() {
+  const sel = document.getElementById('log-file-select');
+  const file = sel ? sel.value : '';
+  const url = '/api/logs?lines=80' + (file ? '&file=' + encodeURIComponent(file) : '');
+  try {
+    const d = await fetch(url).then(r => r.json());
+    const term = document.getElementById('log-terminal');
+    if (!term) return;
+    const lines = d.lines || [];
+    document.getElementById('log-line-count').textContent = lines.length + ' lines';
+    if (!lines.length) { term.innerHTML = '<span style="color:var(--dim)">// no log lines found</span>'; return; }
+    term.innerHTML = lines.map(l => {
+      const fname = `<span style="color:var(--dim);font-size:0.58rem">[${l.file}]</span> `;
+      let color = 'var(--dim)';
+      for (const [kw, c] of Object.entries(LOG_COLORS)) { if (l.line.includes(kw)) { color = c; break; } }
+      const txt = l.line.replace(/&/g,'&amp;').replace(/</g,'&lt;');
+      return fname + `<span style="color:${color}">${txt}</span>`;
+    }).join('\n');
+    term.scrollTop = term.scrollHeight;
+  } catch(e) {}
+}
+
+// ── Agent / Ollama / MCP health panel (below GPU STATUS) ───────────────
+async function refreshServiceHealth() {
+  const el = document.getElementById('health-services');
+  if (!el) return;
+  const row = (label, ok, detail, warn) => {
+    const color = ok ? '#36e27b' : (warn ? '#ffb24d' : '#ff6b6b');
+    const glyph = ok ? '●' : (warn ? '◍' : '○');
+    return `<div style="display:flex;align-items:center;gap:8px;padding:5px 0;border-bottom:1px solid rgba(255,255,255,0.05)">
+        <span style="font-size:0.85rem;color:${color}">${glyph}</span>
+        <span style="min-width:92px;font-family:'Orbitron',sans-serif;font-size:0.68rem;color:#cbd3e0">${label}</span>
+        <span style="font-family:'Share Tech Mono';font-size:0.68rem;color:var(--dim)">${detail}</span>
+      </div>`;
+  };
+  try {
+    const d = await fetch('/api/health/services').then(r => r.json());
+    const a = d.agent || {}, o = d.ollama || {}, m = d.mcp || {};
+    const aPids = Object.entries(a.pids || {}).map(([k, v]) => `${k}:${v}`).join('  ');
+    const loaded = o.loaded || [];
+    let html = '';
+    html += row('🤖 AGENT', !!a.up, a.up ? (aPids || 'running') : 'stopped');
+    html += row('◎ OLLAMA', !!o.up,
+                o.up ? `${o.models} models · VRAM: ${loaded.length ? loaded.join(', ') : 'idle'}` : 'offline',
+                o.up && loaded.length === 0);
+    html += row('🔌 MCP', !!(m.ok && m.enabled > 0),
+                m.ok ? `${m.ready}/${m.enabled} ready · ${m.count} total` : (m.error || 'no mcp.json'),
+                m.ok && m.enabled > 0 && m.ready < m.enabled);
+    if (o.up && o.default_model) {
+      html += `<div style="font-family:'Share Tech Mono';font-size:0.62rem;color:var(--dim);padding-top:6px">default: ${o.default_model}</div>`;
+    }
+    el.innerHTML = html;
+    const ts = document.getElementById('health-ts');
+    if (ts) ts.textContent = d.ts || '';
+  } catch (e) {
+    el.innerHTML = '<span class="color-red" style="font-family:\'Share Tech Mono\';font-size:0.72rem">health check failed</span>';
+  }
+}
+
 // ── Init & polling ────────────────────────────────────────────────────
 async function init() {
-  await Promise.all([refreshHealth(), refreshModels(), refreshNetwork(), refreshMT5(), refreshMCP()]);
+  await Promise.all([refreshHealth(), refreshServiceHealth(), refreshModels(), refreshNetwork(), refreshMT5(), refreshMCP()]);
+  await loadLogFiles();
+  await refreshLogs();
 }
 
 init();
-setInterval(refreshHealth, 5000);
-setInterval(refreshModels, 15000);
-setInterval(refreshNetwork, 20000);
-setInterval(refreshServicesQuick, 10000);
-setInterval(refreshActivity, 3000);
-setInterval(refreshMT5, 3000);
-setInterval(refreshMCP, 30000);
+setInterval(refreshServiceHealth, 8000);
+setInterval(refreshHealth, 8000);
+setInterval(refreshModels, 20000);
+setInterval(refreshNetwork, 30000);
+setInterval(refreshServicesQuick, 15000);
+setInterval(refreshTelegramMonitor, 8000);
+setInterval(refreshActivity, 6000);
+setInterval(refreshAgentStatus, 4000);
+setInterval(refreshMT5, 6000);
+setInterval(refreshLogs, 15000);
+setInterval(refreshMCP, 60000);
 </script>
 </body>
 </html>"""
@@ -4228,8 +4826,17 @@ def main():
 +{bar}+
 """)
 
-    if not args.no_browser:
-        threading.Timer(1.2, lambda: webbrowser.open(
+    auto_open = _CFG.get("dashboard", {}).get("auto_open_browser", True)
+    if not args.no_browser and auto_open:
+        def _open_browser(url: str) -> None:
+            browser_exe = _get_browser_path()
+            if browser_exe:
+                subprocess.Popen([browser_exe, "--new-window", url],
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            else:
+                webbrowser.open(url)
+
+        threading.Timer(1.2, lambda: _open_browser(
             f"http://{HOST}:{args.port}")).start()
 
     app.run(host=HOST, port=args.port, debug=False, use_reloader=False)
