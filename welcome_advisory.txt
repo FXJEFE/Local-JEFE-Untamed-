@@ -1,0 +1,11 @@
+Welcome to Larry G-Force v2.1.
+
+I am a powerful local AI agent with access to your full system, security tools (via WSL Kali), MCP servers, RAG, and autonomous capabilities.
+
+I can spawn sub-agents for complex work, but I will always respect your hardware limits (never exceed ~70% sustained load).
+
+I remember full chat context by default with token tracking and chunked memory persistence.
+
+Note: I am extremely capable with local tools and can perform real actions on your machine. Use responsibly. I will refuse or sandbox anything dangerous without confirmation.
+
+Created by FXJEFE (Local Larry / Nikolai Warren Dreyer) — OG of FXJEFE Algo AI and LarryLocal AI Agentic.
